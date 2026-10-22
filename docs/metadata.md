@@ -44,9 +44,24 @@ um perfil, o metadata das capturas já feitas está em `parcial/NN_classe/` (cam
 | `calibracao_extremos.origem` | caminho do arquivo copiado |
 | `calibracao_extremos.copia_na_sessao` | nome da cópia dentro da pasta (`calibracao_extremos.json`) |
 | `calibracao_extremos.sha256` | SHA-256 da cópia |
+| `condicao` | condição da rodada para `rerun`/`run falhas` (v1.15, acrescentado): `tensao_base_rms`, `frequencia_hz`, `p09_braco`, `passo_final_sin` (`AMETEK_PASSO_FINAL_SIN`), `max_voltage_rms` (`EUT_MAX_VOLTAGE_RMS`), `max_peak_v` (min(`EUT_MAX_PEAK_V`, 425)), `source_voltage_range_rms`, `base_seed`, `capturas_override`, `sorteio_posicao`, `perfil`, `perfis_da_rodada`, `calibracao_extremos_sha256` (`mestre.condicao_atual`) |
+| `rerun_de` | só em sessão criada por `rerun`/`run falhas` (v1.15, acrescentado): `sessao` (pasta de origem), `calibracao_extremos_sha256` (o da origem, igual ao atual), `ids_captura`, `classes` e `itens` (tipo, classe, perfil, indice_global, id_captura de cada item escolhido) |
 
 Em sessão de bancada com `git_sujo = true`, o início do `run` imprime um aviso em destaque
 (linhas de `!`) e registra `WARNING` no log; não bloqueia (não existia mecanismo de bloqueio).
+
+## `falhas.json` (v1.15)
+
+Na pasta da sessão, criado na primeira falha e reescrito atomicamente (`.json.part` -> `os.replace`) a cada nova entrada, ao longo da bateria (`mestre.RegistroFalhas`). Ausente = nenhuma falha registrada. Topo: `formato_falhas` (1), `sessao`, `atualizado_em`, `contexto` e `itens`. Cada item:
+
+| Campo | Significado |
+|---|---|
+| `tipo` | `pulada_capacidade` (exigência acima de `CAPACIDADES_MX30`), `pulada_preflight` (rms/pico/extremo previsto acima do teto), `descartada` (erro durante a captura, nada gravado), `invalida` (gravada, reprovada na validação física), `classe_falhou` (a classe num perfil terminou FALHOU; inclui a que abortou por falha de infraestrutura, com motivo próprio), `nao_executada_orcamento` (não rodou porque o orçamento de 216 TRACe da conexão esgotou) |
+| `classe`, `classe_nome`, `perfil` | id (`"02"`), nome e perfil |
+| `indice_global`, `capture_index`, `nivel_indice`, `seed`, `id_captura` | da captura (`null` em entrada de classe inteira) |
+| `motivo` | texto do motivo |
+| `registrado_em` | ISO 8601 |
+| `contexto` | `base_seed`, `capturas_override`, `perfil`, `perfis_da_rodada`, `sorteio_posicao`, `rerun_de` e a condição de `mestre.CHAVES_CONDICAO_RERUN`: `tensao_base_rms`, `frequencia_hz`, `p09_braco`, `passo_final_sin`, `max_voltage_rms`, `max_peak_v`, `source_voltage_range_rms`, `calibracao_extremos_sha256` |
 
 ## Registro de captura (`NN_classe.json` / linha do `.jsonl`)
 
@@ -62,7 +77,9 @@ Nenhum campo existente foi removido. Campos novos:
 | `pre_trigger_desvio_amostras` | só física, pré-trigger sorteado | `indice_trigger` medido menos o previsto (`round(pre_trigger_s·fs) + margem_amostras_antes`) |
 | `parametros.inicio_impulso_s` (08) | só física | instante do impulso programado (80 ms; 90 ms a 50 Hz com `sorteio_posicao`; `arquivo/analises:docs/analise-2026-10-12/pendente/classe08_fronteira_REVISAR.md`) |
 | `validacao_fisica.posicao_evento` (08) | só física | `inicio_previsto_amostra`, `pico_medido_amostra`, `desvio_amostras` (medido menos previsto), `tolerancia_amostras` (10) e `desvio_pico_pu`; fora da tolerância a captura é marcada inválida (`ok = false`, motivo "posição do impulso") |
-| `validacao_fisica.crista_modelo`, `fator_extremo_crista`, `crista_medida`, `crista_minima_aceita`, `crista_maxima_aceita` | só física (v1.15, spec 26) | crista do ciclo mediano da forma esperada, fator de extremo efetivo usado (o da previsão de pico; 1,0 na 08), crista medida e os limites aceitos (`crista_modelo × (1 − 0,10)` e `crista_modelo × fator × (1 + 0,10)`). `crista_esperada` continua igual a `crista_modelo` |
+| `validacao_fisica.posicao_evento.sobressinal_medido`, `sobressinal_limite`, `sobressinal_acima_do_limite` (08) | só física (v1.15, acrescentado) | sobressinal do impulso como fração do degrau programado A (`amplitude_bancada_pu`): `(medido − senoide ideal)` na amostra do maior desvio, dividido por A, menos 1 (`pico = s + A·(1 + sobressinal)`, a mesma grandeza de `SOBRESSINAL_DO_DEGRAU`). `sobressinal_limite` = 0,55 (`ROTEIRO_BANCADA.md` linhas 197 e 374); `sobressinal_acima_do_limite` é o flag de achado de segurança e **não** reprova a captura. Amostrado a 30 kSa/s contra uma oscilação de ~10 kHz, pode subestimar o pico real (que vale `pico_medido_v`). Ausente se não houve `amplitude_bancada_pu` |
+| `rota_programacao` | só física (v1.15, acrescentado) | como a captura foi programada: `"CSIN"` (05, CSINusoid nativa, até 20 %), `"TRACe"` (waveform; 05 a 30 %) ou `"nativa"` (demais nativas). Só diagnóstico; não altera `gerar()` nem a fonte. Metadata anterior não tem o campo (a P-10 infere pelo nível `parametros.thd` e marca aviso) |
+| `validacao_fisica.crista_modelo`, `fator_extremo_crista`, `crista_medida`, `crista_minima_aceita`, `crista_maxima_aceita` | só física (v1.15, revisão anterior) | crista do ciclo mediano da forma esperada, fator de extremo efetivo usado (o da previsão de pico; 1,0 na 08), crista medida e os limites aceitos (`crista_modelo × (1 − 0,10)` e `crista_modelo × fator × (1 + 0,10)`). `crista_esperada` continua igual a `crista_modelo` |
 | `git_commit`, `git_sujo`, `numpy_versao` | só física | cópia da procedência (o `.jsonl` sobrevive sozinho se for copiado sem a pasta) |
 | `calibracao_extremos_sha256` | só física | SHA-256 da calibração usada na captura; deve bater com `sessao.json` |
 | `tres_versoes` | captura gravada pela v1.15 (em andamento) em diante | `{arquivo, programada}`: onde estão modelo/programada/medida desta captura (o `NN_classe.npz`) e como a programada foi obtida (`docs/tres_versoes.md`) |
@@ -72,6 +89,10 @@ Nenhum campo existente foi removido. Campos novos:
 | `perfil_de_origem` | idem | perfil cujo bloco do `.npz` guarda os dados (`literatura`) (v1.15, acrescentado) |
 | `compartilhada_com_perfis` | idem | lista de todos os perfis que apontam para a captura, origem primeiro (v1.15, acrescentado) |
 | `sha256_captura` | idem | SHA-256 dos arrays da captura (`sessao_io.hash_captura`: `medida`, `modelo`, `programada` em float64 little-endian, com rótulo e tamanho; versão ausente = `NaN`) (v1.15, acrescentado) |
+| `p09_braco` | toda captura (v1.15, acrescentado) | braço do experimento P-09 da conexão: `"A"` (padrão, modo AC), `"B"` (AC+DC, offset 0) ou `"C"` (AC+DC, offset por passo). `AMETEK_P09_BRACO`/`set p09`; no simulado, o da fonte simulada |
+| `media_perdida_maxima_absoluta_pu` | captura TRACe/LIST com modelo e programada (v1.15, acrescentado) | maior `abs(média do ciclo no modelo − média do ciclo na programada)`, pu do pico nominal (`sinais.distancia_modelo_programada`, as mesmas contas de `scripts/analisar_modelo_programado.py`). A programada é a efetiva do braço (no C, com o offset por passo). Na física, o modelo é `gerar()` antes da redução de bancada (08) |
+| `erro_rms_modelo_programada_pu` | idem | rms de `programada − modelo`, pu do pico nominal |
+| `salto_pico_modelo_programada_v` | idem | `(max abs(programada) − max abs(modelo)) × base × √2`, em V: quanto o pico programado se afasta do pico do modelo. `pico_programado_v` (física) não muda |
 | `snr_medido_db` | toda captura | SNR **acrescentado** por nível (`"20.0"`, `"30.0"`, `"40.0"`): janela limpa contra ruído somado, medido só na janela rotulada |
 | `snr_bancada_db` | só física | SNR do ruído próprio da bancada nesta captura (potência da janela / ruído medido na margem anterior por segunda diferença); `null` no simulado |
 | `snr_efetivo_db` | toda captura | por nível: sinal / (ruído da bancada + ruído acrescentado); no simulado igual a `snr_medido_db` |
@@ -85,6 +106,7 @@ Leitores: `recortar_margem.calcular_recorte` (e, por ele, `relatorio_html`) e `a
 usam `inicio_janela` quando existe; sem ele, caem em `indice_trigger` e depois em
 `margem_amostras_antes`, como antes. No `sem_margem/` gerado, `inicio_janela` vale 0
 (o arquivo recortado já começa na janela).
+| `rerun_de` | só em captura feita por `rerun`/`run falhas` (v1.15, acrescentado) | `{"sessao": pasta de origem, "id_captura": mesmo id, "perfil": ...}`; `seed`, `nivel_indice` e `id_captura` são os da captura original |
 
 ## Exemplo (uma captura física; saída de teste com instrumentos simulados)
 

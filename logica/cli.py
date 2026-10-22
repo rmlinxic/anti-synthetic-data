@@ -17,16 +17,19 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import re
 import subprocess
 import sys
 import traceback
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import mestre
 import perfis
 import preflight_new
+import sessao_io
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +88,11 @@ Comandos disponíveis (nenhum energiza a saída sem pedir confirmação própria
                        EXECUTAR-CLASSE-<NN>.                                [ON]
   run <lista>         Roda uma LISTA de classes por intervalos e/ou ids
                        soltos, na ordem numérica: "run 01-07,09-20",
-                       "run 2,5,8", "run 10-16" (espaços são ignorados).
+                       "run 2,5,8", "run 10-16" (espaços ao redor de
+                       vírgulas e hífens são aceitos).
                        Mesma execução e ganchos do run all (resumo final,
-                       set recalibracao/html). Ignora BATERIA_EXCLUIR: roda
-                       exatamente o que foi pedido. Mostra as capturas de
+                       set recalibracao/html). Aplica BATERIA_EXCLUIR e pede
+                       confirmação só da lista efetiva. Mostra as capturas de
                        cada classe e a estimativa de TRACe das escolhidas.
                        Pede EXECUTAR-CLASSES-<lista normalizada>, ex.:
                        EXECUTAR-CLASSES-01-07,09-20.                        [ON]
@@ -99,6 +103,24 @@ Comandos disponíveis (nenhum energiza a saída sem pedir confirmação própria
                        desde a v1.12); rode-as com "run <NN>". Mostra as
                        capturas planejadas e a estimativa de gravações de
                        TRACe antes de pedir a confirmação.
+  run falhas [<pasta_sessao>]
+                       Reexecuta o que deu problema numa sessão (padrão: a
+                       última pasta criada por esta CLI): capturas
+                       descartadas/inválidas, classes que falharam e as não
+                       executadas por orçamento de TRACe, lidas do
+                       <sessao>/falhas.json. Mesma seed, perfil e nível da
+                       captura original; RECUSA sem energizar se tensão,
+                       frequência, braço P-09, passo final SINE, limites
+                       ou calibração atuais diferirem da sessão de origem. Cria sessão NOVA com "rerun_de". Pede a
+                       confirmação normal (EXECUTAR-CLASSE-NN ou
+                       EXECUTAR-CLASSES-<lista>).                           [ON]
+  rerun <pasta_sessao> <id_captura|NN> [...]
+                       Como "run falhas", só para as capturas (ex.: 10-0003)
+                       ou classes (ex.: 10 = todas as entradas da classe em
+                       falhas.json) escolhidas. Aceita também id de captura
+                       gravada (procurado no metadata). Puladas por
+                       capacidade/pré-validação são retiradas (só elas =
+                       recusa: seriam puladas de novo).                     [ON]
   set diagnostico on|off
                        Liga/desliga log extra de STATus:OPERation:CONDition?/
                        OUTPut:STATe?/tensão imediata em pontos-chave de
@@ -113,6 +135,18 @@ Comandos disponíveis (nenhum energiza a saída sem pedir confirmação própria
                        de TRACe, e grava <sessao>/diagnostico_trace/<id>.npz
                        (enviado x lido) + desvio máximo no metadata. Soma
                        alguns segundos por captura (docs/diagnostico.md).   [OFF]
+  set diagnostico bruto [on|off]
+                       Preserva a exportação BYTE/NORMal dos canais antes da
+                       interpolação, sem nova aquisição, em bruto_osciloscopio/.
+                       Arquivos independentes com preamble, tempos e hash.  [OFF]
+  set p09 A|B|C       Experimento P-09 (vale a partir da próxima conexão/run):
+                       A = como sempre (modo AC); B = AC+DC com offset zero;
+                       C = AC+DC com offset DC por passo de LIST (comando NÃO
+                       confirmado no manual: a conexão consulta o suporte com
+                       a saída OFF e recusa o run se a fonte não aceitar, sem
+                       cair para A/B). B/C deixam TODA a conexão em AC+DC,
+                       inclusive as classes nativas. Gravado no metadata como
+                       p09_braco (docs/configuracao.md).                    [A]
   set capturas <N>    Mínimo de capturas por classe na bancada real: cada
                        classe roda max(N, padrão da classe) — ver "list".
                        Em classes com níveis discretos (SAG/SWELL/
@@ -253,6 +287,7 @@ class SessaoCLI:
         # Seed com que a CLI começou (env BASE_SEED ou o padrão): destino de
         # "set seed padrao".
         self._seed_inicial = mestre.BASE_SEED
+        self._bloqueio_sessao = None
         self._runs_nesta_sessao = 0
         # Perfil de faixas de cada run desta CLI, na ordem (vai para sessao.json
         # de cada pasta, em "perfis_usados_na_cli").
@@ -265,6 +300,12 @@ class SessaoCLI:
         # padrão; ver _fim_da_sessao().
         self.recalibracao_ao_fim = False
         self.html_ao_fim = False
+        # Última pasta de sessão criada por esta CLI (destino de "run falhas").
+        self._ultima_sessao_dir: Optional[Path] = None
+        # Modo roteiro (--comando, usado por scripts/visita_bancada.py): uma
+        # exceção num run de classe ou a bateria abortada por infraestrutura
+        # liga esta marca, e o roteiro para (não repete nem segue sozinho).
+        self.falha_infraestrutura = False
 
     # -- infraestrutura ----------------------------------------------------
 
@@ -293,22 +334,42 @@ class SessaoCLI:
 
         Também anexa o log de execução e a transcrição SCPI à pasta — sem
         isso nada do que foi enviado à fonte sobrevive ao fim do processo."""
-        self._runs_nesta_sessao += 1
-        sufixo = "" if self._runs_nesta_sessao == 1 else f"_run{self._runs_nesta_sessao:02d}"
-        sessao_dir = mestre.RESULTS_DIR / f"sessao_{self._sessao_timestamp}{sufixo}"
-        sessao_dir.mkdir(parents=True, exist_ok=True)
-        mestre.SESSION_RESULTS_DIR = sessao_dir
-        mestre.configurar_log_de_sessao(sessao_dir)
-        print(f"Sessão gravando em: {sessao_dir}")
-        # Cópia da calibração + sessao.json (commit, numpy) e aviso de árvore
-        # suja em destaque, já no início do run (ver mestre.preparar_pasta_da_sessao).
-        # A procedência (árvore suja, arquivos novos) é recalculada aqui, a cada run.
-        self._perfis_usados.append(mestre.PERFIL_TODOS_ROTULO if mestre.PERFIL_TODOS else mestre.PERFIL)
-        mestre.preparar_pasta_da_sessao(
-            sessao_dir, bancada=mestre.BENCH_MODE, perfis_usados=list(self._perfis_usados),
-        )
-        if mestre.DIAGNOSTICO_MODE and mestre.BENCH_MODE and DIAGNOSTICO_ABRIR_TERMINAL:
-            self._abrir_terminal_de_diagnostico(sessao_dir / "scpi_transcricao.log")
+        # Recuperar somente arquivos: nunca repetir capturas nem abrir instrumentos.
+        # A pasta do novo run ainda não existe e não entra nesta varredura.
+        sessao_io.recuperar_sessoes_interrompidas(mestre.RESULTS_DIR)
+        self._liberar_bloqueio_sessao()
+        # mkdir exclusivo também protege CLIs iniciadas no mesmo segundo:
+        # nunca reutilize uma pasta existente, mesmo se seu escritor terminou.
+        while True:
+            self._runs_nesta_sessao += 1
+            sufixo = "" if self._runs_nesta_sessao == 1 else f"_run{self._runs_nesta_sessao:02d}"
+            sessao_dir = mestre.RESULTS_DIR / f"sessao_{self._sessao_timestamp}{sufixo}"
+            try:
+                sessao_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            break
+        try:
+            self._bloqueio_sessao = sessao_io.BloqueioSessao(sessao_dir)
+            mestre.SESSION_RESULTS_DIR = sessao_dir
+            self._ultima_sessao_dir = sessao_dir
+            mestre.configurar_log_de_sessao(sessao_dir)
+            print(f"Sessão gravando em: {sessao_dir}")
+            # A procedência é recalculada a cada pasta; a calibração é copiada.
+            self._perfis_usados.append(mestre.PERFIL_TODOS_ROTULO if mestre.PERFIL_TODOS else mestre.PERFIL)
+            mestre.preparar_pasta_da_sessao(
+                sessao_dir, bancada=mestre.BENCH_MODE, perfis_usados=list(self._perfis_usados),
+            )
+            if mestre.DIAGNOSTICO_MODE and mestre.BENCH_MODE and DIAGNOSTICO_ABRIR_TERMINAL:
+                self._abrir_terminal_de_diagnostico(sessao_dir / "scpi_transcricao.log")
+        except BaseException:
+            self._liberar_bloqueio_sessao()
+            raise
+
+    def _liberar_bloqueio_sessao(self) -> None:
+        if self._bloqueio_sessao is not None:
+            self._bloqueio_sessao.close()
+            self._bloqueio_sessao = None
 
     def _abrir_terminal_de_diagnostico(self, caminho_log: Path) -> None:
         """Abre uma janela de console nova fazendo ``tail -f`` de
@@ -381,6 +442,8 @@ class SessaoCLI:
             f"não é mais opt-in)   "
             f"diagnostico: {'ON' if mestre.DIAGNOSTICO_MODE else 'OFF'}   "
             f"diagnostico retrieve: {'ON' if mestre.DIAGNOSTICO_RETRIEVE else 'OFF'}   "
+            f"diagnostico bruto: {'ON' if mestre.SALVAR_BRUTO_OSCILOSCOPIO else 'OFF'}   "
+            f"p09: {mestre.P09_BRACO}   "
             f"set capturas: "
             f"{mestre.CAPTURAS_OVERRIDE if mestre.CAPTURAS_OVERRIDE is not None else 'não (padrão das classes)'}"
         )
@@ -492,9 +555,23 @@ class SessaoCLI:
             f"(referência: a fonte travou na ~{mestre.ESCRITAS_TRACE_REFERENCIA_TRAVA}.ª "
             "gravação de uma conexão em 2026-09-16)."
         )
-        if escritas > mestre.ESCRITAS_TRACE_REFERENCIA_TRAVA:
-            texto = "ATENÇÃO — " + texto + " Considere 'run <NN>' por partes."
+        texto += f" Orçamento operacional: {mestre.LIMITE_ESCRITAS_TRACE_CONEXAO} gravações por conexão."
+        if escritas > mestre.LIMITE_ESCRITAS_TRACE_CONEXAO:
+            texto = "RECUSADA — " + texto + " Divida as classes/capturas em conexões novas."
         return texto
+
+    @staticmethod
+    def _verificar_orcamento_trace(linhas: List[tuple]) -> bool:
+        escritas = sum(info["escritas_trace"] for _, _, info in linhas)
+        if escritas <= mestre.LIMITE_ESCRITAS_TRACE_CONEXAO:
+            return True
+        print(
+            f"Execução recusada: estimativa sem retentativas de {escritas} gravações TRACe excede o "
+            f"orçamento de {mestre.LIMITE_ESCRITAS_TRACE_CONEXAO} por conexão (o ORM também aborta a "
+            f"bateria se o orçamento esgotar com retentativas). Divida classes/capturas "
+            "em conexões novas. Nada foi energizado."
+        )
+        return False
 
     def _imprimir_capturas_por_classe(self) -> None:
         linhas = self._capturas_das_classes()
@@ -526,7 +603,7 @@ class SessaoCLI:
 
     def cmd_set(self, args: List[str]) -> int:
         if len(args) < 2:
-            print("Uso: set diagnostico on|off|retrieve   |   set capturas <N>|padrao   |   set seed <N>|padrao   |   "
+            print("Uso: set diagnostico on|off|retrieve|bruto   |   set p09 A|B|C   |   set capturas <N>|padrao   |   set seed <N>|padrao   |   "
                 "set perfil norma|literatura|fronteira|todos   |   set sorteio on|off   |   "
                 "set recalibracao on|off   |   set html on|off")
             return 1
@@ -541,6 +618,15 @@ class SessaoCLI:
             )
             return 0
         if chave == "diagnostico":
+            if valor == "bruto":
+                estado = args[2].lower() if len(args) > 2 else "on"
+                if estado not in ("on", "off") or len(args) > 3:
+                    print("Uso: set diagnostico bruto [on|off]")
+                    return 1
+                mestre.SALVAR_BRUTO_OSCILOSCOPIO = estado == "on"
+                print(f"diagnostico bruto: {'ON' if mestre.SALVAR_BRUTO_OSCILOSCOPIO else 'OFF'} "
+                      "(exportação BYTE/NORMal em arquivos separados; sem consulta adicional)")
+                return 0
             if valor == "retrieve":
                 # set diagnostico retrieve [on|off]: independente do log (on/off).
                 estado = args[2].lower() if len(args) > 2 else "on"
@@ -558,10 +644,24 @@ class SessaoCLI:
                 )
                 return 0
             if valor not in ("on", "off"):
-                print("Uso: set diagnostico on|off|retrieve [on|off]")
+                print("Uso: set diagnostico on|off|retrieve|bruto [on|off]")
                 return 1
             mestre.DIAGNOSTICO_MODE = valor == "on"
             print(f"diagnostico: {'ON' if mestre.DIAGNOSTICO_MODE else 'OFF'}")
+            return 0
+        if chave == "p09":
+            braco = args[1].strip().upper()
+            if braco not in ("A", "B", "C") or len(args) > 2:
+                print(f"Uso: set p09 A|B|C (mantendo {mestre.P09_BRACO})")
+                return 1
+            mestre.P09_BRACO = braco
+            descricao = {
+                "A": "modo AC, como sempre",
+                "B": "AC+DC com offset zero em todos os passos (isola o efeito AC+DC/P-17)",
+                "C": "AC+DC com offset DC por passo de LIST (consulta o suporte com a saída OFF "
+                     "e recusa o run se a fonte não aceitar; sem fallback)",
+            }[braco]
+            print(f"p09: {braco} — {descricao} (vale a partir do próximo run; gravado no metadata como p09_braco)")
             return 0
         if chave == "capturas":
             if valor in ("padrao", "padrão", "off"):
@@ -716,13 +816,24 @@ class SessaoCLI:
 
     def cmd_run(self, args: List[str]) -> int:
         if not args:
-            print("Uso: run <NN|nome>   ou   run all")
+            print("Uso: run <NN|nome>   |   run <lista>   |   run all   |   run falhas [<pasta_sessao>]")
             return 1
+        if args[0].lower() == "falhas":
+            return self._run_falhas(args[1:])
         if args[0].lower() == "all":
+            if len(args) != 1:
+                print("Comando recusado: 'run all' não aceita argumentos extras. Nada foi energizado.")
+                return 1
             return self._run_all()
-        texto = "".join(args)
+        # Preserva limites entre tokens: juntar sem separador transformava
+        # 'run 1 2,3' em 'run 12,3', executando uma seleção diferente.
+        texto = " ".join(args)
         if "," in texto or "-" in texto:
             return self._run_lista(texto)
+        if len(args) != 1:
+            print("Comando recusado: use vírgulas ou intervalos para várias classes "
+                  "(ex.: run 01,02). Nada foi energizado.")
+            return 1
         return self._run_uma(args[0])
 
     def _run_lista(self, texto: str) -> int:
@@ -734,10 +845,20 @@ class SessaoCLI:
             print(f"Lista de classes recusada: {exc}. Exemplos: run 01-07,09-20 | run 2,5,8 | "
                   "run 10-16. Nada foi energizado.")
             return 1
+        removidas = [numero for numero in ids if f"{numero:02d}" in mestre.BATERIA_EXCLUIR]
+        ids = [numero for numero in ids if f"{numero:02d}" not in mestre.BATERIA_EXCLUIR]
+        if removidas:
+            print(f"Classes removidas por BATERIA_EXCLUIR: {normalizar_lista_classes(removidas)}.")
+        if not ids:
+            print("Nenhuma classe restante após BATERIA_EXCLUIR. Nada foi energizado. "
+                  "Para uma execução isolada intencional, use 'run <NN>'.")
+            return 1
         mapa = {script.stem: script for script in mestre._experiment_scripts()}
         scripts = [mapa[f"{numero:02d}"] for numero in ids]
         normalizada = normalizar_lista_classes(ids)
         linhas = self._capturas_das_classes(scripts)
+        if not self._verificar_orcamento_trace(linhas):
+            return 1
         total_capturas = sum(info["total"] for _, _, info in linhas)
         print(f"Classes escolhidas ({len(linhas)}), na ordem numérica, capturas planejadas:")
         for classe_id, nome, info in linhas:
@@ -760,9 +881,11 @@ class SessaoCLI:
         experimento_cls = mestre.Bancada._carregar_classe_experimento(script_path)
         nome = getattr(experimento_cls, "nome", script_path.stem)
         confirmacao = f"EXECUTAR-CLASSE-{script_path.stem}"
-        extra = ""
+        linhas = self._capturas_das_classes([script_path])
+        if not self._verificar_orcamento_trace(linhas):
+            return 1
+        extra = f" ({self._aviso_escritas_trace(linhas)})"
         if mestre.PERFIL_TODOS:
-            linhas = self._capturas_das_classes([script_path])
             extra = (
                 f" nos 3 perfis ({self._descrever_capturas(linhas[0][2])} capturas planejadas; "
                 f"{self._aviso_escritas_trace(linhas)})"
@@ -774,36 +897,42 @@ class SessaoCLI:
         ):
             return 1
         self._garantir_pasta_sessao()
-        self.autorizar_saida(True)
+        # O bloqueio da sessão só cai DEPOIS dos ganchos de fim (HTML,
+        # recalibração), que escrevem na pasta; try/finally cobre qualquer saída.
         try:
-            with mestre.Bancada.from_env(require_output=True) as bancada:
-                # run_all() sempre passa por 01/NORMAL primeiro, que eleva a
-                # saída a BASE_VOLTAGE_RMS (STEP é "sticky"). Uma classe
-                # isolada aqui não tem essa garantia — sem isto, SAG/SWELL/
-                # INTERRUPTION mediriam baseline no nível de segurança (0 V)
-                # em vez de BASE_VOLTAGE_RMS (ver Bancada.assegurar_tensao_base).
-                bancada.assegurar_tensao_base()
-                executados = bancada.executar_classe_nos_perfis(experimento_cls)
-            resultado = mestre.ResultadoClasse(
-                script_path.stem, nome, ok=True,
-                descartadas=sum(getattr(e, "_capturas_descartadas_count", 0) for e in executados),
-                invalidas=sum(getattr(e, "_capturas_invalidas_count", 0) for e in executados),
-                puladas=sum(getattr(e, "_capturas_puladas_count", 0) for e in executados),
-            )
-            print(f"OK: [{resultado.id}] {resultado.nome} -> {resultado.pasta_esperada}{self._ressalvas(resultado)}")
-            sucesso = True
-        except Exception as exc:
-            sucesso = False
-            resultado = mestre.ResultadoClasse(script_path.stem, nome, ok=False, motivo=str(exc))
-            print(f"FALHOU: [{resultado.id}] {resultado.nome}: {exc}")
-            traceback.print_exc()
+            self.autorizar_saida(True)
+            try:
+                with mestre.Bancada.from_env(require_output=True) as bancada:
+                    # run_all() sempre passa por 01/NORMAL primeiro, que eleva a
+                    # saída a BASE_VOLTAGE_RMS (STEP é "sticky"). Uma classe
+                    # isolada aqui não tem essa garantia — sem isto, SAG/SWELL/
+                    # INTERRUPTION mediriam baseline no nível de segurança (0 V)
+                    # em vez de BASE_VOLTAGE_RMS (ver Bancada.assegurar_tensao_base).
+                    bancada.assegurar_tensao_base()
+                    executados = bancada.executar_classe_nos_perfis(experimento_cls)
+                resultado = mestre.ResultadoClasse(
+                    script_path.stem, nome, ok=True,
+                    descartadas=sum(getattr(e, "_capturas_descartadas_count", 0) for e in executados),
+                    invalidas=sum(getattr(e, "_capturas_invalidas_count", 0) for e in executados),
+                    puladas=sum(getattr(e, "_capturas_puladas_count", 0) for e in executados),
+                )
+                print(f"OK: [{resultado.id}] {resultado.nome} -> {resultado.pasta_esperada}{self._ressalvas(resultado)}")
+                sucesso = True
+            except Exception as exc:
+                sucesso = False
+                self.falha_infraestrutura = True
+                resultado = mestre.ResultadoClasse(script_path.stem, nome, ok=False, motivo=str(exc))
+                print(f"FALHOU: [{resultado.id}] {resultado.nome}: {exc}")
+                traceback.print_exc()
+            finally:
+                self.autorizar_saida(False)
+            self.ultimo_resultado[resultado.id] = resultado
+            # Saída já desligada e Bancada fechada. Classe que falhou pode ter sido
+            # falha de infraestrutura: só o run que terminou OK dispara os ganchos.
+            if sucesso:
+                self._fim_da_sessao(mestre.SESSION_RESULTS_DIR)
         finally:
-            self.autorizar_saida(False)
-        self.ultimo_resultado[resultado.id] = resultado
-        # Saída já desligada e Bancada fechada. Classe que falhou pode ter sido
-        # falha de infraestrutura: só o run que terminou OK dispara os ganchos.
-        if sucesso:
-            self._fim_da_sessao(mestre.SESSION_RESULTS_DIR)
+            self._liberar_bloqueio_sessao()
         return 0 if resultado.ok else 1
 
     def _run_all(self) -> int:
@@ -812,7 +941,13 @@ class SessaoCLI:
             "isoladas com 'run <NN>' se precisar)."
             if mestre.BATERIA_EXCLUIR else ""
         )
-        linhas = self._capturas_das_classes(mestre.scripts_da_bateria_fisica())
+        scripts = mestre.scripts_da_bateria_fisica()
+        if not scripts:
+            print("Nenhuma classe restante após BATERIA_EXCLUIR. Nada foi energizado.")
+            return 1
+        linhas = self._capturas_das_classes(scripts)
+        if not self._verificar_orcamento_trace(linhas):
+            return 1
         total_capturas = sum(info["total"] for _, _, info in linhas)
         if not self.confirmar(
             "Bateria completa das 20 classes, sequencial, sem parar numa falha isolada"
@@ -823,41 +958,218 @@ class SessaoCLI:
             "EXECUTAR-20-CLASSES",
         ):
             return 1
-        return self._executar_scripts(mestre.scripts_da_bateria_fisica())
+        return self._executar_scripts(scripts)
 
-    def _executar_scripts(self, scripts: List[Path]) -> int:
-        """Corpo comum de ``run all`` e ``run <lista>``: uma pasta de sessão,
-        a saída ligada só durante ``executar_bateria`` (que isola falhas de
-        experimento e aborta em falha de infraestrutura), resumo final e os
-        ganchos de fim de run. Quem chama já confirmou a execução."""
+    def _executar_scripts(
+        self, scripts: List[Path], *, perfis_rodada: Optional[Tuple[str, ...]] = None,
+        selecao: Optional[Dict[str, Dict[str, Optional[Tuple[int, ...]]]]] = None,
+    ) -> int:
+        """Corpo comum de ``run all``, ``run <lista>`` e do rerun: uma pasta de
+        sessão, a saída ligada só durante ``executar_bateria`` (que isola
+        falhas de experimento e aborta em falha de infraestrutura), resumo
+        final e os ganchos de fim de run. Quem chama já confirmou a execução.
+        ``selecao`` (rerun): só as classes/perfis/capturas escolhidas, depois
+        de levar a saída à tensão base (``assegurar_tensao_base``)."""
         self._garantir_pasta_sessao()
-        self.autorizar_saida(True)
+        # Bloqueio liberado só depois dos ganchos de fim (ver run de classe única).
         try:
-            with mestre.Bancada.from_env(require_output=True) as bancada:
-                resultados = bancada.executar_bateria(scripts)
-        except Exception as exc:
-            print(f"BATERIA ABORTADA por falha de infraestrutura: {exc}")
-            traceback.print_exc()
-            return 1
-        finally:
-            self.autorizar_saida(False)
+            self.autorizar_saida(True)
+            try:
+                with mestre.Bancada.from_env(require_output=True) as bancada:
+                    if selecao is None:
+                        resultados = bancada.executar_bateria(scripts)
+                    else:
+                        bancada.assegurar_tensao_base()
+                        resultados = bancada.executar_bateria(scripts, perfis_rodada, selecao=selecao)
+            except Exception as exc:
+                self.falha_infraestrutura = True
+                print(f"BATERIA ABORTADA por falha de infraestrutura: {exc}")
+                traceback.print_exc()
+                return 1
+            finally:
+                self.autorizar_saida(False)
 
-        for resultado in resultados:
-            self.ultimo_resultado[resultado.id] = resultado
-        ok = sum(1 for resultado in resultados if resultado.ok)
-        print(f"\nResumo final: {ok}/{len(resultados)} classes OK")
-        for resultado in resultados:
-            if resultado.ok:
-                print(
-                    f"  OK     [{resultado.id}] {resultado.nome} -> {resultado.pasta_esperada}"
-                    f"{self._ressalvas(resultado)}"
+            for resultado in resultados:
+                self.ultimo_resultado[resultado.id] = resultado
+            ok = sum(1 for resultado in resultados if resultado.ok)
+            print(f"\nResumo final: {ok}/{len(resultados)} classes OK")
+            for resultado in resultados:
+                if resultado.ok:
+                    print(
+                        f"  OK     [{resultado.id}] {resultado.nome} -> {resultado.pasta_esperada}"
+                        f"{self._ressalvas(resultado)}"
+                    )
+                elif getattr(resultado, "nao_executada_orcamento", False):
+                    print(f"  NÃO EXECUTADA (orçamento TRACe) [{resultado.id}] {resultado.nome}: "
+                          f"{resultado.motivo}")
+                else:
+                    print(f"  FALHOU [{resultado.id}] {resultado.nome}: {resultado.motivo}")
+            if any(getattr(r, "nao_executada_orcamento", False) for r in resultados):
+                print("Orçamento de TRACe esgotado: OUTPUT OFF confirmado e conexão encerrada; nada foi "
+                      "reconectado. O que não rodou está em falhas.json — confira o painel e use "
+                      f"'run falhas {mestre.SESSION_RESULTS_DIR}' (pede confirmação nova).")
+            # Falha de EXPERIMENTO não impede os ganchos (a bateria seguiu); a de
+            # infraestrutura saiu acima, sem eles.
+            self._fim_da_sessao(mestre.SESSION_RESULTS_DIR)
+            return 0 if ok == len(resultados) else 1
+        finally:
+            self._liberar_bloqueio_sessao()
+
+    # -- rerun do que deu problema (falhas.json) ------------------------------
+
+    _ALVO_RERUN = re.compile(r"^\d{1,2}(-\d{4})?$")
+
+    @staticmethod
+    def _resolver_pasta_sessao(texto: str) -> Optional[Path]:
+        caminho = Path(texto.strip().strip('"'))
+        for candidato in (caminho, mestre.RESULTS_DIR / caminho):
+            if candidato.is_dir():
+                return candidato
+        return None
+
+    def _run_falhas(self, args: List[str]) -> int:
+        """``run falhas [<pasta>]``: todas as entradas reexecutáveis de falhas.json."""
+        if args:
+            pasta = self._resolver_pasta_sessao(" ".join(args))
+            if pasta is None:
+                print(f"Pasta de sessão não encontrada: {' '.join(args)!r}. Nada foi energizado.")
+                return 1
+        else:
+            pasta = self._ultima_sessao_dir
+            if pasta is None:
+                print("Nenhuma sessão criada por esta CLI ainda: use 'run falhas <pasta_sessao>'. "
+                      "Nada foi energizado.")
+                return 1
+        return self._rerun(pasta, None)
+
+    def cmd_rerun(self, args: List[str]) -> int:
+        """``rerun <pasta> <id_captura|NN> [...]`` (a pasta pode ter espaços)."""
+        alvos: List[str] = []
+        resto = list(args)
+        while resto and self._ALVO_RERUN.match(resto[-1]):
+            alvos.insert(0, resto.pop())
+        if not resto or not alvos:
+            print("Uso: rerun <pasta_sessao> <id_captura|NN> [...]   (ex.: rerun sessao_2026-10-21_10-00-00 "
+                  "10-0003 02). Nada foi energizado.")
+            return 1
+        pasta = self._resolver_pasta_sessao(" ".join(resto))
+        if pasta is None:
+            print(f"Pasta de sessão não encontrada: {' '.join(resto)!r}. Nada foi energizado.")
+            return 1
+        return self._rerun(pasta, alvos)
+
+    @staticmethod
+    @contextmanager
+    def _contexto_restaurado(contexto: dict, rerun_de: dict):
+        """Põe nos globais do ``mestre`` a seed base, ``set capturas``, sorteio
+        e perfis da sessão de origem (e ``RERUN_DE``) só durante o rerun."""
+        nomes = ("BASE_SEED", "CAPTURAS_OVERRIDE", "SORTEIO_POSICAO", "PERFIL", "PERFIL_TODOS", "RERUN_DE")
+        antes = {nome: getattr(mestre, nome) for nome in nomes}
+        try:
+            mestre.BASE_SEED = int(contexto["base_seed"])
+            mestre.CAPTURAS_OVERRIDE = contexto.get("capturas_override")
+            mestre.SORTEIO_POSICAO = bool(contexto.get("sorteio_posicao", True))
+            perfis_rodada = tuple(contexto.get("perfis_da_rodada") or (perfis.PERFIL_PADRAO,))
+            mestre.PERFIL_TODOS = len(perfis_rodada) > 1
+            mestre.PERFIL = perfis.PERFIL_PADRAO if mestre.PERFIL_TODOS else perfis_rodada[0]
+            mestre.RERUN_DE = rerun_de
+            yield perfis_rodada
+        finally:
+            for nome, valor in antes.items():
+                setattr(mestre, nome, valor)
+
+    def _rerun(self, pasta: Path, alvos: Optional[List[str]]) -> int:
+        """Reproduz EXATAMENTE capturas/classes de ``pasta`` (mesmo
+        indice_global -> mesma seed, capture_index, perfil e nível), numa
+        sessão NOVA com ``rerun_de``. Recusa, sem energizar, se a condição
+        atual (tensão, frequência, braço P-09, passo final SINE, limites ou
+        calibração: ``mestre.CHAVES_CONDICAO_RERUN``) diferir da original."""
+        try:
+            contexto, selecao, itens, puladas = mestre.selecionar_para_rerun(pasta, alvos)
+            if contexto.get("base_seed") is None:
+                raise mestre.RerunRecusadoError("a sessão de origem não registra a seed base")
+            # Tensão, frequência, P-09, passo final SINE, limites e calibração
+            # têm de ser os da origem; senão a captura não se reproduz.
+            mestre.verificar_condicao_para_rerun(contexto, mestre.condicao_atual(), pasta)
+        except mestre.RerunRecusadoError as exc:
+            print(f"Rerun recusado: {exc}. Nada foi energizado.")
+            return 1
+        if puladas:
+            print(f"AVISO: {len(puladas)} captura(s) escolhida(s) foram PULADAS na origem (capacidade/"
+                  "pré-validação) e foram RETIRADAS do rerun: na mesma condição seriam puladas de novo "
+                  f"({', '.join(str(i.get('id_captura')) for i in puladas)}).")
+        ids = sorted({str(i["id_captura"]) for i in itens if i.get("id_captura")})
+        rerun_de = {
+            "sessao": str(pasta),
+            "calibracao_extremos_sha256": contexto.get("calibracao_extremos_sha256"),
+            "ids_captura": ids,
+            "classes": sorted(selecao),
+            "itens": [
+                {k: i.get(k) for k in ("tipo", "classe", "perfil", "indice_global", "id_captura")}
+                for i in itens
+            ],
+        }
+        mapa = {script.stem: script for script in mestre._experiment_scripts()}
+        faltando = [classe for classe in selecao if classe not in mapa]
+        if faltando:
+            print(f"Rerun recusado: classe(s) inexistente(s) {faltando}. Nada foi energizado.")
+            return 1
+        scripts = [mapa[classe] for classe in sorted(selecao)]
+        with self._contexto_restaurado(contexto, rerun_de) as perfis_rodada:
+            config = mestre._build_config()
+            linhas = []
+            for script in scripts:
+                experimento_cls = mestre.Bancada._carregar_classe_experimento(script)
+                total = escritas = 0
+                exatas = True
+                for perfil, indices in selecao[script.stem].items():
+                    config_perfil = replace(config, perfil=perfil, indices_permitidos=indices)
+                    # O plano restaurado tem de dar o MESMO capture_index (nível)
+                    # de cada captura original; senão o rerun não a reproduz.
+                    plano = dict(experimento_cls(mestre.Bancada(None, None, config_perfil)).plano_de_capturas(False))
+                    for item in itens:
+                        if str(item.get("classe")).zfill(2) != script.stem or item.get("perfil") not in (perfil, None) \
+                                or item.get("indice_global") is None:
+                            continue
+                        indice = int(item["indice_global"])
+                        original = item.get("capture_index")
+                        if indice not in plano or (original is not None and int(original) != plano[indice]):
+                            print(f"Rerun recusado: {item.get('id_captura')} ({perfil}) não reproduz o plano "
+                                  f"original (índice {indice}, nível {original}; plano atual: "
+                                  f"{plano.get(indice, 'ausente')}). Nada foi energizado.")
+                            return 1
+                    info = mestre.capturas_efetivas_da_classe(experimento_cls, config_perfil)
+                    total += info["total"]
+                    escritas += info["escritas_trace"]
+                    exatas = exatas and info["escritas_trace_exatas"]
+                linhas.append((script.stem, getattr(experimento_cls, "nome", script.stem), {
+                    "total": total, "escritas_trace": escritas, "escritas_trace_exatas": exatas,
+                    "niveis": 1, "padrao": 1, "por_nivel": 1,
+                }))
+            if not self._verificar_orcamento_trace(linhas):
+                return 1
+            print(f"Rerun de {pasta} (seed base {contexto['base_seed']}, set capturas "
+                  f"{contexto.get('capturas_override')}, perfis {', '.join(perfis_rodada)}):")
+            for classe_id, nome, info in linhas:
+                indices = "; ".join(
+                    f"{perfil}: {'classe inteira' if idx is None else ', '.join(f'{classe_id}-{i + 1:04d}' for i in idx)}"
+                    for perfil, idx in selecao[classe_id].items()
                 )
-            else:
-                print(f"  FALHOU [{resultado.id}] {resultado.nome}: {resultado.motivo}")
-        # Falha de EXPERIMENTO não impede os ganchos (a bateria seguiu); a de
-        # infraestrutura saiu acima, sem eles.
-        self._fim_da_sessao(mestre.SESSION_RESULTS_DIR)
-        return 0 if ok == len(resultados) else 1
+                print(f"  {classe_id}  {nome:30s} {info['total']} captura(s) ({indices})")
+            ids_classes = [int(classe) for classe in sorted(selecao)]
+            esperado = (
+                f"EXECUTAR-CLASSE-{scripts[0].stem}" if len(scripts) == 1
+                else f"EXECUTAR-CLASSES-{normalizar_lista_classes(ids_classes)}"
+            )
+            total_capturas = sum(info["total"] for _, _, info in linhas)
+            if not self.confirmar(
+                f"Vai energizar a saída e REEXECUTAR {total_capturas} captura(s) de {len(scripts)} classe(s) "
+                f"da sessão {pasta.name} (mesma seed/perfil/nível), numa sessão nova. "
+                f"{self._aviso_escritas_trace(linhas)} Confirme fisicamente probe, cabos, E-stop e EUT.",
+                esperado,
+            ):
+                return 1
+            return self._executar_scripts(scripts, perfis_rodada=perfis_rodada, selecao=selecao)
 
     # -- ganchos de fim de run (set recalibracao / set html) ----------------
 
@@ -957,6 +1269,7 @@ class SessaoCLI:
         "lowvoltage": cmd_lowvoltage,
         "native": cmd_native,
         "run": cmd_run,
+        "rerun": cmd_rerun,
     }
 
     def loop(self) -> int:
@@ -995,8 +1308,91 @@ class SessaoCLI:
         return 0
 
 
-def main() -> int:
-    return SessaoCLI().loop()
+    # -- modo roteiro (scripts/visita_bancada.py) ---------------------------
+
+    # Códigos de saída do roteiro, lidos pelo orquestrador da visita.
+    ROTEIRO_OK = 0
+    ROTEIRO_COM_FALHAS = 1       # bateria terminou, alguma classe/captura falhou
+    ROTEIRO_INFRAESTRUTURA = 2   # exceção, bateria abortada ou preflight falhou: PARAR
+    ROTEIRO_NAO_CONFIRMADO = 3   # operador não digitou a confirmação: nada energizado
+    ROTEIRO_INVALIDO = 4         # comando desconhecido ou set recusado: nada energizado
+
+    def executar_roteiro(self, comandos: List[str]) -> int:
+        """Executa ``comandos`` na ordem, como se o operador os digitasse no
+        prompt, e sai. As confirmações que energizam continuam sendo pedidas
+        pelo ``confirmar()`` de sempre, no teclado do operador: o roteiro só
+        fornece os comandos, nunca as respostas. Para no primeiro comando
+        inválido, na primeira confirmação não digitada e na primeira falha de
+        infraestrutura; uma bateria que terminou com classes falhas segue."""
+        original = self.confirmar
+        recusas: List[str] = []
+
+        def confirmar(aviso: str, esperado: str) -> bool:
+            if original(aviso, esperado):
+                return True
+            recusas.append(esperado)
+            return False
+
+        self.confirmar = confirmar
+        codigo = self.ROTEIRO_OK
+        try:
+            for linha in comandos:
+                partes = linha.split()
+                if not partes:
+                    continue
+                comando, args = partes[0].lower(), partes[1:]
+                handler = self.COMANDOS.get(comando)
+                if handler is None:
+                    print(f"Roteiro: comando desconhecido {comando!r}. Nada mais será executado.")
+                    return self.ROTEIRO_INVALIDO
+                print(f"\nbancada> {linha}")
+                try:
+                    retorno = handler(self, args)
+                except KeyboardInterrupt:
+                    print("\nINTERROMPIDO pelo operador (Ctrl+C). A saída foi desligada ao encerrar a "
+                          "conexão — confira OUTPUT OFF no painel da AMETEK.")
+                    return self.ROTEIRO_INFRAESTRUTURA
+                except Exception as exc:  # noqa: BLE001 - qualquer falha encerra o roteiro
+                    print(f"ERRO: {exc}")
+                    traceback.print_exc()
+                    return self.ROTEIRO_INFRAESTRUTURA
+                if recusas:
+                    return self.ROTEIRO_NAO_CONFIRMADO
+                if self.falha_infraestrutura:
+                    return self.ROTEIRO_INFRAESTRUTURA
+                if retorno:
+                    if comando in ("run", "rerun"):
+                        codigo = self.ROTEIRO_COM_FALHAS
+                    elif comando in ("comm", "trigger", "lowvoltage", "native"):
+                        return self.ROTEIRO_INFRAESTRUTURA
+                    else:
+                        print(f"Roteiro: '{linha}' recusado. Nada mais será executado.")
+                        return self.ROTEIRO_INVALIDO
+            return codigo
+        finally:
+            self.confirmar = original
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CLI da bancada (sem argumentos: prompt interativo).")
+    parser.add_argument(
+        "--comando", action="append", default=[],
+        help="executa este comando da CLI e sai (repetível, na ordem). As confirmações que "
+             "energizam continuam sendo digitadas pelo operador no teclado.",
+    )
+    args = parser.parse_args(argv)
+    if args.comando and not sys.stdin.isatty():
+        # Confirmação vinda de pipe/arquivo não é do operador: recusa antes de tudo.
+        print("Modo roteiro recusado: a entrada não é um terminal. As confirmações que energizam "
+              "precisam ser digitadas pelo operador. Nada foi executado.")
+        return SessaoCLI.ROTEIRO_INVALIDO
+    sessao = SessaoCLI()
+    try:
+        return sessao.executar_roteiro(args.comando) if args.comando else sessao.loop()
+    finally:
+        sessao._liberar_bloqueio_sessao()
 
 
 if __name__ == "__main__":

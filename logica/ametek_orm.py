@@ -17,6 +17,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from .politica_traces import LIMITE_ESCRITAS_TRACE_CONEXAO, LimiteEscritasTraceError
+except ImportError:  # execução dos scripts com logica/ no sys.path
+    from politica_traces import LIMITE_ESCRITAS_TRACE_CONEXAO, LimiteEscritasTraceError
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -80,6 +85,84 @@ class FalhaFatalDeInstrumento(AmetekORMError):
     ``gerar()``), que é isolada e não impede as classes seguintes."""
 
 
+class BracoP09Error(FalhaFatalDeInstrumento):
+    """Experimento P-09 (``AMETEK_P09_BRACO`` B ou C) sem as pré-condições na
+    conexão: modo AC+DC não preparado com a saída OFF, ou troca de modo que
+    exigiria a saída ligada. Herda ``FalhaFatalDeInstrumento`` de propósito:
+    recusa a bateria inteira em vez de isolar a classe; nunca cai para A."""
+
+
+class OffsetPorPassoNaoSuportadoError(BracoP09Error):
+    """Braço C da P-09: a fonte não aceitou a consulta ``SOURce:LIST:VOLTage:
+    OFFSet?`` em AC+DC (sem resposta, resposta ilegível ou erro na fila). O
+    comando não está definido no manual (só "Related Command", p. 96); sem
+    confirmação do instrumento a bateria é recusada antes de energizar."""
+
+
+class CapacidadeExcedidaError(ParameterOutOfBoundsError):
+    """Exigência acima da capacidade DOCUMENTADA da fonte (``CAPACIDADES_MX30``),
+    recusada antes de qualquer I/O. Subclasse de ``ParameterOutOfBoundsError``:
+    é recusa determinística (sem retry) e a pré-validação de captura
+    (``mestre.ExperimentoBase.avaliar_captura_na_bancada``) a usa para PULAR a
+    captura com motivo ``pulada_capacidade``."""
+
+
+@dataclass(frozen=True)
+class Capacidade:
+    """Faixa aceita pela fonte para uma exigência, com a fonte da informação."""
+
+    minimo: float
+    maximo: float
+    unidade: str
+    fonte: str
+
+
+# Capacidades da AMETEK MX30 que o código confere ANTES de I/O (tabela também
+# em docs/limites_e_calibracao.md). Páginas: AMETEK MX SCPI Programming Manual,
+# P/N 7003-961 Rev AB; linhas: docs/manuais_txt/AMETEK_MX_SCPI_Programming_Manual.txt.
+# Não inclui max_voltage_rms/max_peak_v/max_current_a (limites de software da
+# bancada, intocáveis) nem o orçamento de 216 TRACe (politica_traces: não é
+# limite do fabricante).
+CAPACIDADES_MX30: Dict[str, Capacidade] = {
+    "passos_list": Capacidade(1, 32, "pontos", "manual p. 153, l. 7104/7121: 'up to 32 settings (or points) in the list'"),
+    "traces_por_grupo": Capacidade(1, 50, "formas", "manual p. 126, l. 5849: 'Up to 50 user-defined waveforms ... per group'"),
+    "dwell_s": Capacidade(0.001, 9.0e4, "s", "manual p. 91, l. 4066: LIST:DWELl 0.001 to 9E4"),
+    "pulse_width_s": Capacidade(0.001, 90000.0, "s", "manual p. 106, l. 4795: PULSe:WIDTh 1 msecs to 90,000 secs"),
+    "dc_offset_v": Capacidade(-220.0, 220.0, "V", "manual p. 10, l. 406: 220 Vdc na Série II (250 na Série I; usa o menor)"),
+    # O manual NÃO traz a faixa numérica de frequência da MX30: ela é do
+    # instrumento (LIMit:FREQuency?, p. 86, l. 3789, só consulta). 45..500 Hz é
+    # a faixa de PROJETO já usada pelo setter, program_capture e
+    # frequency_drift_list (não verificada contra a fonte).
+    "frequencia_hz": Capacidade(45.0, 500.0, "Hz", "faixa de projeto; manual só remete a LIMit:FREQuency? (p. 86, l. 3789)"),
+}
+
+
+def verificar_capacidade(nome: str, valor: float, contexto: str = "") -> None:
+    """Recusa (``CapacidadeExcedidaError``) ``valor`` fora de ``CAPACIDADES_MX30[nome]``.
+    Função pura: não toca instrumento."""
+    capacidade = CAPACIDADES_MX30[nome]
+    try:
+        valor = float(valor)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CapacidadeExcedidaError(f"{contexto or nome}: valor não numérico {valor!r}") from exc
+    if not math.isfinite(valor) or not capacidade.minimo <= valor <= capacidade.maximo:
+        raise CapacidadeExcedidaError(
+            f"{contexto or nome} = {valor:.8g} {capacidade.unidade} fora da capacidade da fonte "
+            f"{capacidade.minimo:g}..{capacidade.maximo:g} {capacidade.unidade} ({capacidade.fonte})"
+        )
+
+
+def verificar_exigencias(exigencias: Dict[str, object], contexto: str = "") -> None:
+    """Confere um dicionário ``{nome_da_capacidade: valor ou lista de valores}``
+    contra ``CAPACIDADES_MX30`` (primeira violação levanta)."""
+    for nome, valores in exigencias.items():
+        if isinstance(valores, (list, tuple, np.ndarray)):
+            for valor in valores:
+                verificar_capacidade(nome, valor, f"{contexto}{nome}" if contexto else nome)
+        else:
+            verificar_capacidade(nome, valores, f"{contexto}{nome}" if contexto else nome)
+
+
 def _normalized_identity(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", value.upper())
 
@@ -118,11 +201,70 @@ class ProgramacaoCaptura:
     pico_acumulado_v: np.ndarray
     pico_reconstruido_v: float
 
+    # Passo extra no fim do LIST com a forma interna SINE na tensão base
+    # (dwell de 1 ciclo, nada gravado na Flash) — ver AmetekMX30.passo_final_sin.
+    passo_final_sin: bool = False
+    # Experimento P-09 (ver AmetekMX30.P09_BRACOS). "A": como sempre. "B": AC+DC
+    # com offset zero (só o modo muda; a forma emitida prevista é a de A). "C":
+    # AC+DC com offset DC por passo de LIST (SOURce:LIST:VOLTage:OFFSet, NÃO
+    # confirmado no manual) igual à média de cada ciclo que a TRACe perde.
+    p09_braco: str = "A"
+    # Só no braço C: offset de cada passo TRACe (pu do pico nominal), já com o
+    # offset global ``dc_offset_pu`` somado; None nos braços A e B.
+    dc_offset_por_passo_pu: Optional[np.ndarray] = None
+
+    @property
+    def passos_offsets_v(self) -> np.ndarray:
+        """Braço C: ``SOURce:LIST:VOLTage:OFFSet`` de cada passo (V, como
+        enviado); o SINE final fica no offset global. Vazio fora do braço C."""
+        if self.dc_offset_por_passo_pu is None:
+            return np.zeros(0, dtype=np.float64)
+        pico_nominal_v = self.base_voltage_rms * math.sqrt(2.0)
+        offsets = np.asarray(self.dc_offset_por_passo_pu, dtype=np.float64) * pico_nominal_v
+        if self.passo_final_sin:
+            offsets = np.append(offsets, self.dc_offset_pu * pico_nominal_v)
+        return _como_enviado(offsets)
+
+    def texto_list_offsets(self) -> str:
+        return formatar_valores(self.passos_offsets_v)
+
+    def exigencias_de_capacidade(self) -> Dict[str, object]:
+        """O que esta programação exige da fonte, nos nomes de
+        ``CAPACIDADES_MX30``: passos de LIST (TRACEs + SINE final), formas de
+        usuário no grupo, dwell de cada passo (1 ciclo) e offsets do braço C."""
+        dwell_s = self.pontos_por_ciclo / AmetekMX30.FS_HZ
+        exigencias: Dict[str, object] = {
+            "passos_list": len(self.passos_nomes),
+            "traces_por_grupo": len(self.trace_names),
+            "dwell_s": dwell_s,
+        }
+        if self.dc_offset_por_passo_pu is not None:
+            exigencias["dc_offset_v"] = [float(v) for v in self.passos_offsets_v]
+        return exigencias
+
+    def verificar_capacidades(self) -> None:
+        """Recusa (``CapacidadeExcedidaError``), sem I/O, o que excede ``CAPACIDADES_MX30``."""
+        verificar_exigencias(self.exigencias_de_capacidade(), "programação TRACe/LIST: ")
+
+    @property
+    def passos_nomes(self) -> Tuple[str, ...]:
+        """Formas de ``SOURce:LIST:FUNCtion:SHAPe``: as TRACEs e, se ligado, SINE."""
+        if self.passo_final_sin:
+            return self.trace_names + (AmetekMX30.PASSO_FINAL_SIN_FORMA,)
+        return self.trace_names
+
+    @property
+    def passos_tensoes_rms(self) -> np.ndarray:
+        """``SOURce:LIST:VOLTage`` de cada passo; o SINE final fica na tensão base."""
+        if self.passo_final_sin:
+            return np.append(self.list_voltages_rms, _como_enviado(np.array([self.base_voltage_rms])))
+        return self.list_voltages_rms
+
     def comando_trace(self, indice: int) -> str:
         return f"TRACe:DATA {self.trace_names[indice]},{formatar_valores(self.traces[indice])}"
 
     def texto_list_voltages(self) -> str:
-        return formatar_valores(self.list_voltages_rms)
+        return formatar_valores(self.passos_tensoes_rms)
 
     def programada_pu(self) -> np.ndarray:
         """A forma que a fonte emite, de volta na grade de 30 kSa/s da captura,
@@ -148,7 +290,39 @@ class ProgramacaoCaptura:
                 continue
             volts = np.interp(posicao, grade, trace, period=pontos) * (float(rms_v) / rms_trace)
             ciclos.append(volts / pico_nominal_v)
+        if self.dc_offset_por_passo_pu is not None:
+            # Braço C (P-09): cada passo leva o seu offset (como enviado), no
+            # lugar do offset global único.
+            return np.concatenate(ciclos) + self.offset_por_amostra_pu()
         return np.concatenate(ciclos) + self.dc_offset_pu
+
+    def offset_por_amostra_pu(self) -> np.ndarray:
+        """Offset DC de cada amostra dos ``ciclos`` passos TRACe (pu do pico
+        nominal): constante ``dc_offset_pu`` nos braços A/B; no braço C, o
+        offset de cada passo como enviado (``passos_offsets_v``)."""
+        n = self.pontos_por_ciclo
+        if self.dc_offset_por_passo_pu is None:
+            return np.full(self.ciclos * n, float(self.dc_offset_pu), dtype=np.float64)
+        pico_nominal_v = self.base_voltage_rms * math.sqrt(2.0)
+        por_passo = self.passos_offsets_v[: self.ciclos] / pico_nominal_v
+        return np.repeat(por_passo, n)
+
+
+    def margem_final_pu(self) -> np.ndarray:
+        """Um ciclo (``pontos_por_ciclo`` amostras, pu do pico nominal) do que a
+        fonte emite DEPOIS do último ciclo da TRACE, enquanto a lista não é
+        reiniciada: com ``passo_final_sin``, uma senoide de pico 1 (rms =
+        tensão base) mais o offset DC; sem, a repetição do último ciclo da
+        TRACE (a lista fica no último passo)."""
+        n = self.pontos_por_ciclo
+        if self.passo_final_sin:
+            fase = 2.0 * math.pi * np.arange(n, dtype=np.float64) / n
+            return np.sin(fase) + self.dc_offset_pu
+        return self.programada_pu()[-n:]
+
+    def programada_com_margem_pu(self) -> np.ndarray:
+        """``programada_pu()`` seguida de um ciclo de ``margem_final_pu()``."""
+        return np.concatenate([self.programada_pu(), self.margem_final_pu()])
 
 
 class AmetekMX30:
@@ -191,6 +365,20 @@ class AmetekMX30:
     # arm() logaria "devolveu '0'": ESR fica como padrão.
     SINCRONISMO = os.environ.get("AMETEK_SINCRONISMO", "ESR").strip().upper()
 
+    PASSO_FINAL_SIN_FORMA = "SINE"
+
+    # Experimento P-09 (AMETEK_P09_BRACO, docs/configuracao.md). "A" é o
+    # comportamento de sempre e o padrão; "B" e "C" deixam a conexão em AC+DC
+    # (SOURce:MODE ACDC, programado com a saída OFF em configure_safe_baseline).
+    P09_BRACOS = ("A", "B", "C")
+    # Maior offset DC em AC+DC: 220 Vdc na Série II, 250 Vdc na Série I
+    # (manual SCPI p. 10). O menor dos dois, já que a série não é lida.
+    MAX_DC_OFFSET_V = 220.0
+    # Consulta do braço C. Só aparece como "Related Command" (manual p. 96):
+    # NÃO confirmada no manual; a bancada decide (scripts/diag_list_offset.py).
+    CONSULTA_LIST_OFFSET = "SOURce:LIST:VOLTage:OFFSet?"
+    COMANDO_LIST_OFFSET = "SOURce:LIST:VOLTage:OFFSet"
+
     def __init__(
         self,
         port: str = "COM10",
@@ -207,7 +395,26 @@ class AmetekMX30:
         diagnostico: bool = False,
         visa_resource=None,
         resource_manager=None,
+        passo_final_sin: bool = False,
+        p09_braco: str = "A",
+        sim_list_offset_suportado: bool = False,
     ):
+        # Experimental: ativação explícita até validação física da margem.
+        self.passo_final_sin = bool(passo_final_sin)
+        braco = str(p09_braco).strip().upper()
+        if braco not in self.P09_BRACOS:
+            raise ParameterOutOfBoundsError(
+                f"AMETEK_P09_BRACO={p09_braco!r} inválido; use A, B ou C (padrão A)"
+            )
+        # Fixo por conexão (o cache de TRACe é por instância): trocar de braço
+        # exige uma conexão nova (a CLI cria uma a cada run).
+        self._p09_braco = braco
+        # B/C: True depois de preparar_braco_p09() pôr a conexão em AC+DC com
+        # a saída OFF. C: resultado da consulta de suporte (None = não feita).
+        self._p09_preparado = False
+        self.p09_suporte_list_offset: Optional[dict] = None
+        # B/C: a fonte confirmou SOURce:LIST:VOLTage:OFFSet nesta conexão.
+        self._list_offset_suportado = False
         self.port = port
         self.baudrate = int(baudrate)
         self.timeout_s = float(timeout_s)
@@ -287,6 +494,13 @@ class AmetekMX30:
             # SOURce:LIST:* tem sua própria consulta :POINts?, independente
             # das outras (ver _simulate_write/_simulate_query).
             "list_points": {},
+            # Fila de SYST:ERR? simulada (vazia salvo nos casos abaixo) e a
+            # flag de simulação do braço C: a fonte simulada aceita ou não
+            # SOURce:LIST:VOLTage:OFFSet (não confirmado no manual).
+            "erros": [],
+            "list_offset_suportado": bool(sim_list_offset_suportado),
+            "list_offset": "",
+            "source_mode": "AC",
         }
         if not self.simulated and self._resource is None:
             self.connect()
@@ -302,6 +516,11 @@ class AmetekMX30:
     @property
     def is_connected(self) -> bool:
         return self.simulated or self._connected
+
+    @property
+    def p09_braco(self) -> str:
+        """Braço do experimento P-09 desta conexão ("A", "B" ou "C"); só leitura."""
+        return self._p09_braco
 
     @staticmethod
     def _port_to_visa_resource(port: str) -> str:
@@ -391,8 +610,35 @@ class AmetekMX30:
         upper = command.strip().upper()
         return upper.startswith(cls._GRAVA_FLASH) and "?" not in upper.split(",", 1)[0]
 
+    @staticmethod
+    def _recusar_quebra_de_linha(command: str) -> None:
+        """Um comando é UMA linha SCPI. ``\\n``/``\\r`` internos fariam a fonte
+        executar linhas que a contagem de TRACe (por comando) não vê, burlando
+        o orçamento por conexão. Recusa antes de qualquer contagem ou I/O."""
+        if "\r" in command or "\n" in command:
+            raise ValueError(
+                f"Comando SCPI com quebra de linha embutida recusado: {command!r}. "
+                "Envie uma linha por chamada."
+            )
+
     def _raw_write(self, command: str, *, append_eot: Optional[bool] = None) -> None:
         command = command.strip()
+        self._recusar_quebra_de_linha(command)
+        # Contar ANTES do envio: timeout não prova que a fonte deixou de
+        # receber os dados. A tentativa incerta consome o orçamento também.
+        # DATA relativo após ';' também pode repetir o subsistema TRACe
+        # anterior. Contá-lo conservadoramente impede escapar pelo SCPI
+        # composto, ainda que o firmware rejeite a sintaxe enviada.
+        escritas = len(re.findall(
+            r"(?:^|;)\s*:?(?:(?:TRACE|TRAC):DATA|DATA)(?=\s)", command, re.I,
+        ))
+        if escritas:
+            with self._lock:
+                self.verificar_orcamento_traces(escritas)
+                self.escritas_trace += escritas
+                # Escrita direta ou incompleta invalida a forma anterior.
+                # program_capture só repõe a assinatura após todos os uploads.
+                self._last_capture_signature = None
         _transcrever("W", command)
         if append_eot is None:
             # A USB serial da MX30 da bancada exige LF e uma transferência EOT
@@ -479,6 +725,7 @@ class AmetekMX30:
 
     def query(self, command: str) -> str:
         command = command.strip()
+        self._recusar_quebra_de_linha(command)
         _transcrever("Q", command)
         with self._lock:
             if self.simulated:
@@ -540,6 +787,10 @@ class AmetekMX30:
 
     def _simulate_write(self, command: str) -> None:
         upper = command.upper()
+        if self._simulate_list_offset_write(upper, command):
+            return
+        if upper.startswith(("SOURCE:MODE ", "SOUR:MODE ", "MODE ")):
+            self._sim["source_mode"] = upper.rsplit(None, 1)[-1]
         list_axis = self._list_axis_for_write(upper)
         if upper.startswith("OUTPUT:STATE "):
             self._sim["output"] = upper.endswith((" ON", " 1"))
@@ -591,12 +842,39 @@ class AmetekMX30:
             except ValueError:
                 pass
 
+    _CABECALHOS_LIST_OFFSET = (
+        "SOURCE:LIST:VOLTAGE:OFFSET", "SOUR:LIST:VOLT:OFFS", "LIST:VOLTAGE:OFFSET", "LIST:VOLT:OFFS",
+    )
+
+    def _simulate_list_offset_write(self, upper: str, command: str) -> bool:
+        """Simulador do braço C (P-09): ``SOURce:LIST:VOLTage:OFFSet <v,...>``
+        guarda os valores se ``sim_list_offset_suportado``; senão deixa
+        ``-113`` na fila, como a Rev. 5.53 faz com cabeçalho não implementado
+        (ver ``aguardar_resposta``). Devolve True se tratou o comando."""
+        cabecalho, _, valores = upper.partition(" ")
+        if cabecalho not in self._CABECALHOS_LIST_OFFSET or not valores:
+            return False
+        if not self._sim["list_offset_suportado"]:
+            self._sim["erros"].append('-113,"Undefined header"')
+        else:
+            self._sim["list_offset"] = command.split(None, 1)[1].strip()
+        return True
+
     def _simulate_query(self, command: str) -> str:
         upper = command.upper()
         if upper == "*IDN?":
             return self.idn or "AMETEK,MX30-3Pi,SIMULATED,4.00"
         if upper in {"SYSTEM:ERROR?", "SYST:ERR?"}:
+            if self._sim["erros"]:
+                return str(self._sim["erros"].pop(0))
             return '0,"No error"'
+        if upper.rstrip("?") in self._CABECALHOS_LIST_OFFSET and upper.endswith("?"):
+            if not self._sim["list_offset_suportado"]:
+                # Rev. 5.53 com query não implementada: não responde (timeout)
+                # e deixa -113 na fila (docstring de aguardar_resposta()).
+                self._sim["erros"].append('-113,"Undefined header"')
+                raise CommunicationError(f"Timeout simulado aguardando resposta a {command!r}")
+            return str(self._sim["list_offset"] or "0")
         if upper == "*OPC?":
             return "1"
         if upper in {"OUTPUT:STATE?", "OUTP?"}:
@@ -711,6 +989,9 @@ class AmetekMX30:
         transientes em sequência sem desligar; ``program_capture`` conta com
         a saída já ligada e nunca a desliga entre capturas.
         """
+        # P-09 B/C: a conexão só energiza depois de preparada em AC+DC com a
+        # saída OFF (e, no C, com o suporte confirmado). Recusa antes de I/O.
+        self._exigir_braco_p09_preparado("energize_baseline()")
         if self.simulated:
             self.output_enabled = True
             return
@@ -917,6 +1198,7 @@ class AmetekMX30:
             )
         if not width_s > 0:
             raise ParameterOutOfBoundsError(f"Duração do pulso deve ser positiva; recebido {width_s}")
+        verificar_capacidade("pulse_width_s", width_s, "PULSe:WIDTh")
         voltage_rms = self._na_resolucao_da_fonte(voltage_rms)
         self.aguardar_idle()
         # Ver comentário equivalente em trigger_step(): neutraliza listas de
@@ -1026,6 +1308,17 @@ class AmetekMX30:
         na primeira classe da bateria (01/NORMAL)."""
         if self._modo_saida != "ACDC":
             return
+        if self._p09_braco != "A":
+            # P-09 B/C: o estado seguro da conexão é AC+DC com offset zero.
+            # Voltar a AC aqui trocaria SOURce:MODE com a saída LIGADA (o
+            # manual, p. 98, zera a saída a cada troca); a volta a AC é com a
+            # saída OFF, em safe_shutdown() ou no configure_safe_baseline()
+            # da próxima conexão.
+            self.write("SOURce:VOLTage:OFFSet 0")
+            self.write("*WAI")
+            self.assert_no_errors("restaurar SOURce:VOLTage:OFFSet 0 (P-09, mantém AC+DC)")
+            self._zerar_offsets_lista("restaurar estado (fim de classe/recuperação)")
+            return
         self.write("SOURce:VOLTage:OFFSet 0")
         self.write("SOURce:MODE AC")
         self.write("*WAI")
@@ -1081,6 +1374,7 @@ class AmetekMX30:
             )
         if not dwell_s > 0:
             raise ParameterOutOfBoundsError(f"Dwell deve ser positivo; recebido {dwell_s}")
+        verificar_capacidade("dwell_s", dwell_s, "LIST:DWELl")
         self.aguardar_idle()
         # Causa EXATA do ``-226 Lists not same length`` da classe 18 quando ela
         # roda depois da 17 (manual §4.17, p. 90: "All active subsystems that
@@ -1095,6 +1389,8 @@ class AmetekMX30:
         self.write(f"LIST:FREQuency {start_hz:.8g},{end_hz:.8g}")
         self.write(f"LIST:VOLTage {voltage_rms:.8g},{voltage_rms:.8g}")
         self.write(f"LIST:DWELl {dwell_s:.8g},{dwell_s:.8g}")
+        # P-09 B/C: nenhum offset de LIST de uma captura C anterior (no A, nada).
+        self._zerar_offsets_lista("frequency_drift_list", 2)
         # Rev. 5.53 rejeita ':COUNt' (-113 Undefined header) e também rejeita
         # sem o prefixo 'SOURce:' — confirmado em preflight_new.py
         # --list-diagnostics: só 'SOURce:LIST:REPeat' (sem ':COUNt') é aceito.
@@ -1104,6 +1400,19 @@ class AmetekMX30:
         self.write("LIST:COUNt 1")
         self.write("LIST:STEP AUTO")
         self.write("VOLTage:MODE LIST")
+        # Este LIST substitui o STEP/PULSe anterior também no readback de
+        # arm(). Sem isto, a classe 18 herda expectativas STEP/FIX e é
+        # recusada mesmo quando os modos LIST foram aplicados corretamente.
+        # Preserva a confirmação dos eixos independentes e do comprimento
+        # das listas ativas antes de qualquer INITiate.
+        self._transiente_esperado = {
+            "VOLTage:MODE?": "LIST",
+            "FUNCtion:MODE?": "FIX",
+            "SOURce:FREQuency:MODE?": "LIST",
+            "SOURce:LIST:FREQuency:POINts?": 2,
+            "SOURce:LIST:VOLTage:POINts?": 2,
+            "SOURce:LIST:DWELl:POINts?": 2,
+        }
 
     def enable_dc_offset(self, offset_v: float, *, ac_peak_v: float) -> None:
         """Liga o modo ACDC e programa um offset contínuo permanente de
@@ -1113,12 +1422,20 @@ class AmetekMX30:
         não só a amplitude AC."""
         offset_v = float(offset_v)
         ac_peak_v = float(ac_peak_v)
+        verificar_capacidade("dc_offset_v", offset_v, "SOURce:VOLTage:OFFSet")
         combined_peak_v = abs(offset_v) + ac_peak_v
         if combined_peak_v > self.max_peak_v:
             raise ParameterOutOfBoundsError(
                 f"Offset {offset_v:.3f} V + pico AC {ac_peak_v:.3f} V = {combined_peak_v:.3f} V "
                 f"excede o limite de pico {self.max_peak_v:.3f} V"
             )
+        if self._p09_braco != "A":
+            # P-09 B/C: a conexão já está em AC+DC desde configure_safe_baseline
+            # (saída OFF); nenhuma troca de modo com a saída ligada.
+            self._exigir_braco_p09_preparado("enable_dc_offset()")
+            self.write(f"SOURce:VOLTage:OFFSet {offset_v:.8g}")
+            self.assert_no_errors("SOURce:VOLTage:OFFSet (P-09, já em AC+DC)")
+            return
         self._log_diagnostico("antes_sourcemode_acdc")
         self.write("SOURce:MODE ACDC")
         # Trocar SOURce:MODE também deixa a fonte ocupada — mesma razão do
@@ -1299,6 +1616,166 @@ class AmetekMX30:
         self._forma_atual = "SINusoid"
         self._frequencia_base_hz = float(frequency_hz)
         self._frequencia_alterada = False
+        self._p09_preparado = False
+        # P-09: no braço A não faz nada (nenhum comando a mais). B/C deixam a
+        # conexão em AC+DC aqui, ainda com a saída OFF confirmada acima.
+        self.preparar_braco_p09()
+
+    def _exigir_braco_p09_preparado(self, contexto: str) -> None:
+        """Braços B/C: recusa (sem I/O) se a conexão não foi posta em AC+DC
+        por ``preparar_braco_p09()``. No braço A não faz nada."""
+        if self._p09_braco == "A":
+            return
+        if not self._p09_preparado or self._modo_saida != "ACDC":
+            raise BracoP09Error(
+                f"P-09 braço {self._p09_braco}: {contexto} recusado — a conexão não está em "
+                "AC+DC preparada com a saída OFF (configure_safe_baseline/preparar_braco_p09). "
+                "Trocar SOURce:MODE com a saída ligada zera a saída (manual p. 98)."
+            )
+
+    def consultar_suporte_offset_lista(self, *, modo_restaurar: Optional[str] = None) -> dict:
+        """Só consulta, nunca energiza: com a saída OFF confirmada, põe a fonte
+        em AC+DC, pergunta ``SOURce:LIST:VOLTage:OFFSet?`` e lê ``SYST:ERR?``.
+        ``modo_restaurar`` ("AC", "ACDC" ou "DC"): se dado, volta a esse modo
+        no fim (a Rev. 5.53 não implementa ``SOURce:MODE?``, então o modo
+        anterior vem de quem chama). Devolve um dicionário com ``suportado``
+        (resposta numérica, sem erro na fila), a resposta, os erros e os
+        comandos de modo enviados. Recusa com a saída ligada (antes de mudar
+        qualquer coisa)."""
+        if self.output_enabled:
+            raise BracoP09Error(
+                "Consulta de SOURce:LIST:VOLTage:OFFSet? recusada: OUTPUT está ligado "
+                "(trocar SOURce:MODE com a saída ligada zera a saída, manual p. 98)"
+            )
+        if modo_restaurar is not None:
+            modo_restaurar = str(modo_restaurar).strip().upper()
+            if modo_restaurar not in {"AC", "ACDC", "DC"}:
+                raise ParameterOutOfBoundsError(f"Modo a restaurar inválido: {modo_restaurar!r}")
+        resposta: Optional[str] = None
+        falha_consulta: Optional[str] = None
+        restaurado = None
+        concluido = False
+        try:
+            self.write("*CLS")
+            self.write("SOURce:MODE ACDC")
+            self.write("*WAI")
+            self.assert_no_errors("SOURce:MODE ACDC (consulta de suporte P-09)")
+            self._modo_saida = "ACDC"
+            try:
+                resposta = self.query(self.CONSULTA_LIST_OFFSET)
+            except CommunicationError as exc:
+                falha_consulta = str(exc)
+                # A fonte pode ficar muda depois de um cabeçalho desconhecido;
+                # espera voltar a responder (*IDN?) antes de ler a fila.
+                self.aguardar_resposta()
+            erros = self.check_errors()
+            valores: Optional[List[float]] = None
+            if resposta is not None and resposta.strip():
+                try:
+                    valores = [float(item) for item in resposta.split(",")]
+                except ValueError:
+                    valores = None
+                if valores is not None and not all(math.isfinite(v) for v in valores):
+                    valores = None
+            suportado = valores is not None and not erros and falha_consulta is None
+            if modo_restaurar is not None:
+                self._restaurar_modo_saida_off(modo_restaurar)
+                restaurado = modo_restaurar
+            concluido = True
+        finally:
+            if not concluido and modo_restaurar is not None and restaurado is None:
+                # Falhou no meio: volta ao modo anterior, sempre com a saída
+                # OFF; o erro original continua subindo.
+                try:
+                    self._restaurar_modo_saida_off(modo_restaurar)
+                except Exception:  # noqa: BLE001 - não mascara o erro original
+                    logger.exception("Não foi possível restaurar SOURce:MODE %s após falha na consulta P-09",
+                                     modo_restaurar)
+        return {
+            "consulta": self.CONSULTA_LIST_OFFSET,
+            "resposta": resposta,
+            "valores": valores,
+            "falha_consulta": falha_consulta,
+            "erros_scpi": [list(item) for item in erros],
+            "suportado": bool(suportado),
+            "modo_restaurado": restaurado,
+        }
+
+    def _restaurar_modo_saida_off(self, modo: str) -> None:
+        """``SOURce:MODE <modo>`` só com a saída OFF confirmada."""
+        if self.output_enabled:
+            raise BracoP09Error(f"OUTPUT ligado; SOURce:MODE {modo} não enviado (consulta P-09)")
+        self.write(f"SOURce:MODE {modo}")
+        self.write("*WAI")
+        self.assert_no_errors(f"restaurar SOURce:MODE {modo} (consulta P-09)")
+        self._modo_saida = modo
+
+    def _zerar_offsets_lista(self, contexto: str, pontos: Optional[int] = None) -> None:
+        """Braços B/C (P-09), com ``SOURce:LIST:VOLTage:OFFSet`` confirmado na
+        conexão: programa offsets ZERO (``pontos`` valores; sem ``pontos``, o
+        tamanho atual de ``SOURce:LIST:VOLTage:POINts?``, mínimo 1), confere a
+        fila e lê de volta. Sem isto, offsets de uma captura C ficariam na lista
+        para a próxima programação LIST (ex.: classe 18). Qualquer falha é
+        ``BracoP09Error`` (fatal: a bateria para no estado seguro). Sem suporte
+        confirmado (B numa fonte que não tem o comando) não há offset de lista
+        a limpar e não envia nada; no braço A, nunca."""
+        if self._p09_braco == "A" or not self._list_offset_suportado:
+            return
+        try:
+            if pontos is None:
+                pontos = int(float(self.query("SOURce:LIST:VOLTage:POINts?")))
+            pontos = max(1, int(pontos))
+            self.write(f"{self.COMANDO_LIST_OFFSET} {','.join('0' for _ in range(pontos))}")
+            errors = self.check_errors()
+            if errors:
+                raise BracoP09Error(f"AMETEK rejeitou offsets zero de LIST ({contexto}): {errors}")
+            lidos = [float(v) for v in self.query(self.CONSULTA_LIST_OFFSET).split(",")]
+        except BracoP09Error:
+            raise
+        except Exception as exc:
+            raise BracoP09Error(f"Falha zerando offsets de LIST ({contexto}): {exc}") from exc
+        if len(lidos) != pontos or any(not math.isfinite(v) or abs(v) > self.RESOLUCAO_TENSAO_V for v in lidos):
+            raise BracoP09Error(
+                f"Offsets de LIST não zerados ({contexto}): lido {lidos!r}, esperado {pontos} zeros"
+            )
+
+    def preparar_braco_p09(self) -> None:
+        """Braços B/C da P-09, chamado ao fim de ``configure_safe_baseline``
+        (saída OFF): no C, confirma o suporte a ``SOURce:LIST:VOLTage:OFFSet``
+        e recusa (``OffsetPorPassoNaoSuportadoError``) sem fallback para A/B;
+        depois ``SOURce:MODE ACDC`` + ``SOURce:VOLTage:OFFSet 0``. A volta a AC
+        é com a saída OFF (``safe_shutdown``). No braço A não envia nada."""
+        if self._p09_braco == "A":
+            return
+        if self.output_enabled:
+            raise BracoP09Error(
+                f"P-09 braço {self._p09_braco}: OUTPUT ligado; o modo AC+DC só é programado com a saída OFF"
+            )
+        # B e C consultam o suporte: C exige; B só usa a resposta para saber se
+        # há offsets de LIST (de um C anterior) a zerar.
+        suporte = self.consultar_suporte_offset_lista()
+        self.p09_suporte_list_offset = suporte
+        self._list_offset_suportado = bool(suporte["suportado"])
+        if self._p09_braco == "C":
+            if not suporte["suportado"]:
+                raise OffsetPorPassoNaoSuportadoError(
+                    "P-09 braço C recusado antes de energizar: a fonte não confirmou "
+                    f"{self.CONSULTA_LIST_OFFSET} em AC+DC (resposta={suporte['resposta']!r}, "
+                    f"erros={suporte['erros_scpi']}, falha={suporte['falha_consulta']!r}). "
+                    "Sem fallback: use AMETEK_P09_BRACO=A ou B. O modo AC volta no próximo "
+                    "configure_safe_baseline()."
+                )
+        self.write("SOURce:VOLTage:OFFSet 0")
+        self._zerar_offsets_lista("preparação da conexão")
+        self.assert_no_errors(f"SOURce:VOLTage:OFFSet 0 (P-09 braço {self._p09_braco})")
+        if self.output_enabled:
+            raise InstrumentHardwareError("AMETEK ligou a saída durante a preparação AC+DC da P-09")
+        self._p09_preparado = True
+        logger.warning(
+            "P-09 braço %s: conexão em AC+DC (offset %s) com a saída OFF; classes nativas também "
+            "rodam em AC+DC nesta conexão.", self._p09_braco,
+            "por passo de LIST" if self._p09_braco == "C" else "zero",
+        )
 
     def clear_all_traces(self) -> None:
         """Apaga todas as TRACEs de usuário. Só pode ser chamada com OUTPUT OFF,
@@ -1334,6 +1811,18 @@ class AmetekMX30:
 
     def _ensure_trace_slots(self, trace_names: Sequence[str]) -> None:
         catalog = self._trace_catalog()
+        # Manual p. 126: até 50 formas de usuário por grupo. Recusa antes de
+        # qualquer TRACe:DEFine (gravação na Flash) se as novas não cabem.
+        # Conta só os slots do projeto (TCC*) + os novos: NÃO VERIFICADO se o
+        # catálogo da Rev. 5.53 lista também formas de fábrica (contá-las
+        # recusaria capturas que cabem) — docs/limites_e_calibracao.md §2.1.
+        ausentes = [name for name in trace_names if name not in catalog]
+        if ausentes:
+            do_projeto = {name for name in catalog if name.upper().startswith("TCC")}
+            verificar_capacidade(
+                "traces_por_grupo", len(do_projeto | set(ausentes)),
+                f"formas de usuário TCC* no grupo ({len(do_projeto)} no catálogo + {len(ausentes)} novas)",
+            )
         for name in trace_names:
             if name not in catalog:
                 # Gravação em Flash: com N nomes ausentes, isso sozinho leva
@@ -1420,6 +1909,8 @@ class AmetekMX30:
         base_voltage_rms: float,
         frequency_hz: float,
         dc_offset_pu: float = 0.0,
+        passo_final_sin: bool = False,
+        p09_braco: str = "A",
     ) -> ProgramacaoCaptura:
         """Função pura (sem SCPI, sem estado) que decide o que ``program_capture``
         programa: ciclos de ``FS_HZ / frequency_hz`` amostras, cada um sem a
@@ -1428,10 +1919,30 @@ class AmetekMX30:
         ``SOURce:LIST:VOLTage``.
         ``program_capture()`` envia exatamente isto e
         ``ProgramacaoCaptura.programada_pu()`` reconstrói a forma emitida,
-        offline. Levanta ``ValueError`` nas mesmas condições de antes."""
-        waveform = np.asarray(waveform_pu, dtype=np.float64)
+        offline. Recusa parâmetros inválidos antes de qualquer comunicação SCPI.
+
+        ``p09_braco`` (P-09): "A" e "B" programam o mesmo (B só muda o modo
+        da saída). "C" acrescenta o offset DC de cada passo = offset global +
+        média do ciclo que a TRACe perde (``dc_offset_por_passo_pu``), e o
+        pico de cada passo passa a incluir esse offset."""
+        braco = str(p09_braco).strip().upper()
+        if braco not in cls.P09_BRACOS:
+            raise ParameterOutOfBoundsError(f"Braço P-09 inválido: {p09_braco!r} (use A, B ou C)")
+        try:
+            base_voltage_rms = float(base_voltage_rms)
+            frequency_hz = float(frequency_hz)
+            dc_offset_pu = float(dc_offset_pu)
+            waveform = np.asarray(waveform_pu, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ParameterOutOfBoundsError("Parâmetros de captura devem ser numéricos") from exc
+        if not math.isfinite(base_voltage_rms) or base_voltage_rms <= 0:
+            raise ParameterOutOfBoundsError("Tensão base deve ser finita e positiva")
+        if not math.isfinite(frequency_hz) or frequency_hz <= 0:
+            raise ParameterOutOfBoundsError("Frequência deve ser finita e positiva")
+        if not math.isfinite(dc_offset_pu):
+            raise ParameterOutOfBoundsError("Offset DC deve ser finito")
         if waveform.shape != (cls.CAPTURE_POINTS,) or not np.all(np.isfinite(waveform)):
-            raise ValueError("A captura para a AMETEK deve conter exatamente 6000 valores finitos")
+            raise ParameterOutOfBoundsError("A captura para a AMETEK deve conter exatamente 6000 valores finitos")
         # pontos_por_ciclo é o tamanho, em amostras, de UM período fechado da
         # onda na frequência que será programada. Cada TRACE representa
         # exatamente um ciclo (o manual exige 1024 pontos = 1 ciclo por
@@ -1440,14 +1951,16 @@ class AmetekMX30:
         # troca de passo do LIST (bug corrigido: antes fixo em 600 amostras,
         # que só fecha um ciclo a 50 Hz).
         pontos_por_ciclo_f = cls.FS_HZ / frequency_hz
+        if not math.isfinite(pontos_por_ciclo_f) or not 1 <= pontos_por_ciclo_f <= cls.CAPTURE_POINTS:
+            raise ParameterOutOfBoundsError("Frequência incompatível com a grade de captura")
         pontos_por_ciclo = round(pontos_por_ciclo_f)
         if abs(pontos_por_ciclo_f - pontos_por_ciclo) > 1e-6:
-            raise ValueError(
+            raise ParameterOutOfBoundsError(
                 f"FS_HZ/frequency_hz ({cls.FS_HZ}/{frequency_hz}) não é um número inteiro "
                 "de amostras por ciclo"
             )
         if cls.CAPTURE_POINTS % pontos_por_ciclo != 0:
-            raise ValueError(
+            raise ParameterOutOfBoundsError(
                 f"{cls.CAPTURE_POINTS} amostras não dividem em ciclos inteiros de "
                 f"{pontos_por_ciclo} amostras (frequency_hz={frequency_hz})"
             )
@@ -1459,10 +1972,16 @@ class AmetekMX30:
         list_voltages = []
         traces = []
         pico_acumulado = []
+        offsets_por_passo = []
         reconstructed_peak_v = pico_dc_v
         for index in range(ciclos):
             start = index * pontos_por_ciclo
             cycle = waveform[start : start + pontos_por_ciclo] - dc_component
+            # Braço C: o passo carrega o offset global + a média do ciclo (o
+            # que a TRACe perde, manual p. 126). Nos braços A/B, o global.
+            offset_passo = dc_component + float(np.mean(cycle)) if braco == "C" else dc_component
+            offsets_por_passo.append(offset_passo)
+            pico_offset_v = abs(offset_passo) * base_voltage_rms * math.sqrt(2.0)
             # rms da componente CA do ciclo (sem a média): a fonte remove o DC
             # da TRACE e a escala para o rms de LIST:VOLTage (manual p. 126);
             # com o rms "com média" a amplitude CA saía inflada nos ciclos de
@@ -1476,6 +1995,9 @@ class AmetekMX30:
             scale = float(np.max(np.abs(trace)))
             if scale < 1e-12:
                 trace = np.zeros(cls.TRACE_POINTS, dtype=np.float64)
+                # Ciclo sem CA: o passo emite só o seu offset (no braço A,
+                # o global, que já é o valor inicial do máximo).
+                reconstructed_peak_v = max(reconstructed_peak_v, pico_offset_v)
             else:
                 trace /= scale
                 # Pico físico emitido: a fonte escala a TRACE (pico 1) para o
@@ -1492,9 +2014,22 @@ class AmetekMX30:
                 cycle_peak_v = (
                     float(np.max(np.abs(enviada))) * float(f"{voltage_rms:.8g}") / rms_trace
                 )
-                reconstructed_peak_v = max(reconstructed_peak_v, cycle_peak_v + pico_dc_v)
+                if braco == "C":
+                    # Pico COM SINAL do passo: max|CA escalada + offset do
+                    # passo| (offset como enviado, %.8g), não |CA| + |offset|
+                    # (que superestima quando o pico CA tem o sinal oposto).
+                    offset_enviado_v = float(f"{offset_passo * base_voltage_rms * math.sqrt(2.0):.8g}")
+                    escala_v = float(f"{voltage_rms:.8g}") / rms_trace
+                    cycle_peak_v = float(np.max(np.abs(enviada * escala_v + offset_enviado_v)))
+                    reconstructed_peak_v = max(reconstructed_peak_v, cycle_peak_v)
+                else:
+                    reconstructed_peak_v = max(reconstructed_peak_v, cycle_peak_v + pico_offset_v)
             traces.append(_como_enviado(trace))
             pico_acumulado.append(reconstructed_peak_v)
+        if passo_final_sin:
+            # O SINE final também carrega o offset DC configurado em ACDC.
+            reconstructed_peak_v = max(reconstructed_peak_v,
+                base_voltage_rms * math.sqrt(2.0) * (1.0 + abs(dc_component)))
         return ProgramacaoCaptura(
             base_voltage_rms=float(base_voltage_rms),
             frequency_hz=float(frequency_hz),
@@ -1506,7 +2041,22 @@ class AmetekMX30:
             list_voltages_rms=_como_enviado(np.array(list_voltages, dtype=np.float64)),
             pico_acumulado_v=np.array(pico_acumulado, dtype=np.float64),
             pico_reconstruido_v=float(reconstructed_peak_v),
+            passo_final_sin=bool(passo_final_sin),
+            p09_braco=braco,
+            dc_offset_por_passo_pu=(
+                np.array(offsets_por_passo, dtype=np.float64) if braco == "C" else None
+            ),
         )
+
+    def verificar_orcamento_traces(self, novas_escritas: int) -> None:
+        """Recusa sem I/O se as tentativas ultrapassariam a política vigente."""
+        if self.escritas_trace + novas_escritas > LIMITE_ESCRITAS_TRACE_CONEXAO:
+            raise LimiteEscritasTraceError(
+                f"Orçamento TRACe da conexão excedido: {self.escritas_trace} tentativas "
+                f"já consumidas + {novas_escritas} novas, limite operacional "
+                f"{LIMITE_ESCRITAS_TRACE_CONEXAO}. Divida a campanha e encerre a conexão; "
+                "não retente nesta conexão. O orçamento não é limite do fabricante."
+            )
 
     def program_capture(
         self,
@@ -1516,25 +2066,99 @@ class AmetekMX30:
         frequency_hz: float,
         dc_offset_pu: float = 0.0,
     ) -> None:
-        waveform = np.asarray(waveform_pu, dtype=np.float64)
-        if waveform.shape != (self.CAPTURE_POINTS,) or not np.all(np.isfinite(waveform)):
-            raise ValueError("A captura para a AMETEK deve conter exatamente 6000 valores finitos")
-        physical_peak = float(np.max(np.abs(waveform)) * base_voltage_rms * math.sqrt(2.0))
-        if physical_peak > self.max_peak_v:
-            logger.warning(
-                "Pico calculado %.3f V excede limite %.3f V; prosseguindo sem carga.",
-                physical_peak, self.max_peak_v,
-            )
-        # Ciclos, TRACes e LIST:VOLTage vêm da função pura montar_programacao()
-        # (a mesma que reconstrói a forma "programada" offline): o que se envia
-        # e o que se grava como programado não podem divergir.
+        # Validação inteiramente offline: nenhuma escrita, consulta de catálogo,
+        # criação de slots ou alteração do cache acontece antes da recusa.
+        # O planejador puro também serve à análise fora da faixa física; a
+        # operação no instrumento deve respeitar a mesma faixa do setter de
+        # frequência e de frequency_drift_list(), antes até de montar TRACEs.
+        try:
+            frequency_hz = float(frequency_hz)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ParameterOutOfBoundsError("Frequência deve ser numérica") from exc
+        if not 45.0 <= frequency_hz <= 500.0:
+            raise ParameterOutOfBoundsError(f"Frequência {frequency_hz} Hz fora de 45..500 Hz")
         programacao = self.montar_programacao(
-            waveform, base_voltage_rms=base_voltage_rms, frequency_hz=frequency_hz,
-            dc_offset_pu=dc_offset_pu,
+            waveform_pu, base_voltage_rms=base_voltage_rms, frequency_hz=frequency_hz,
+            dc_offset_pu=dc_offset_pu, passo_final_sin=self.passo_final_sin,
+            p09_braco=self._p09_braco,
         )
+        # Capacidades do manual (LIST <= 32 passos, <= 50 TRACEs, dwell):
+        # recusa antes de qualquer escrita, consulta de catálogo ou slot.
+        programacao.verificar_capacidades()
+        waveform = np.asarray(waveform_pu, dtype=np.float64)
+        base_voltage_rms = programacao.base_voltage_rms
+        frequency_hz = programacao.frequency_hz
+        dc_offset_pu = programacao.dc_offset_pu
+        if base_voltage_rms > self.max_voltage_rms:
+            raise ParameterOutOfBoundsError(
+                f"Tensão base {base_voltage_rms:.8g} Vrms excede limite {self.max_voltage_rms:.8g} Vrms"
+            )
+        physical_peak = float(np.max(np.abs(waveform))) * base_voltage_rms * math.sqrt(2.0)
+        for nome, pico in (
+            # A senoide imediata fica ativa antes de selecionar o LIST e
+            # também recebe o offset em modo ACDC, com ou sem SINE final.
+            ("Pico da senoide base com offset DC",
+             base_voltage_rms * math.sqrt(2.0) * (1.0 + abs(dc_offset_pu))),
+            ("Pico da captura", physical_peak),
+            ("Pico reconstruído da TRACE", programacao.pico_reconstruido_v),
+        ):
+            if not math.isfinite(pico) or pico > self.max_peak_v:
+                raise ParameterOutOfBoundsError(
+                    f"{nome} {pico:.8g} V excede limite {self.max_peak_v:.8g} V"
+                )
+        list_voltages = [float(value) for value in programacao.passos_tensoes_rms]
+        for index, voltage_rms in enumerate(list_voltages):
+            if not math.isfinite(voltage_rms) or not 0 <= voltage_rms <= self.max_voltage_rms:
+                raise ParameterOutOfBoundsError(
+                    f"Ciclo {index}: {voltage_rms:.8g} Vrms fora do limite 0..{self.max_voltage_rms:.8g} Vrms"
+                )
+        if not np.all(np.isfinite(programacao.traces)):
+            raise ParameterOutOfBoundsError("TRACE reconstruída contém valores não finitos")
+        list_offsets_v = [float(value) for value in programacao.passos_offsets_v]
+        if self._p09_braco == "C":
+            # Mesmas recusas, com o offset de cada passo: finito, dentro do
+            # offset máximo do manual (p. 10), e o rms total do passo
+            # (sqrt(CA² + CC²)) dentro de max_voltage_rms. O pico de cada passo
+            # com o seu offset já está em pico_reconstruido_v (validado acima).
+            if len(list_offsets_v) != len(list_voltages):
+                raise ParameterOutOfBoundsError("Offsets por passo e LIST:VOLTage com tamanhos diferentes")
+            for index, (offset_v, voltage_rms) in enumerate(zip(list_offsets_v, list_voltages)):
+                if not math.isfinite(offset_v) or abs(offset_v) > self.MAX_DC_OFFSET_V:
+                    raise ParameterOutOfBoundsError(
+                        f"Ciclo {index}: offset {offset_v:.8g} V fora de ±{self.MAX_DC_OFFSET_V:.8g} V"
+                    )
+                rms_total = math.hypot(voltage_rms, offset_v)
+                if not math.isfinite(rms_total) or rms_total > self.max_voltage_rms:
+                    raise ParameterOutOfBoundsError(
+                        f"Ciclo {index}: rms total CA+CC {rms_total:.8g} V excede limite "
+                        f"{self.max_voltage_rms:.8g} Vrms"
+                    )
+        if self._p09_braco != "A":
+            # P-09 B/C: recusa antes de qualquer I/O se a conexão não está em
+            # AC+DC preparada com a saída OFF — nunca troca o modo aqui.
+            self._exigir_braco_p09_preparado("program_capture()")
+        reconstructed_peak_v = programacao.pico_reconstruido_v
         pontos_por_ciclo = programacao.pontos_por_ciclo
         ciclos = programacao.ciclos
         trace_names = programacao.trace_names
+
+        signature = (
+            waveform.tobytes(), trace_names,
+            float(base_voltage_rms), float(frequency_hz), float(dc_offset_pu),
+        )
+        if self._p09_braco != "A":
+            # O braço entra na assinatura: o cache nunca reaproveita uma
+            # programação de outro braço (os offsets de C também).
+            signature += (self._p09_braco, tuple(list_offsets_v))
+        # Se a forma mudou, recusar ANTES de comandos, catálogo ou slots.
+        # Uma forma idêntica pode ser reutilizada, mas só após confirmação
+        # do catálogo. Se ele sumiu, aplicar o orçamento antes de mutações.
+        candidata_cache = not self.simulated and self._last_capture_signature == signature
+        if not candidata_cache:
+            self.verificar_orcamento_traces(len(trace_names))
+        reaproveitar = candidata_cache and self._trace_catalog_contains(trace_names)
+        if not reaproveitar:
+            self.verificar_orcamento_traces(len(trace_names))
 
         # ABORt aqui não desliga OUTPUT (a saída fica ligada durante toda a
         # bateria — ver energize_baseline()). Só reseta o sistema de trigger.
@@ -1550,14 +2174,22 @@ class AmetekMX30:
         self.write("FUNCtion:MODE FIXed")
         self.write("VOLTage:MODE FIXed")
         self.assert_no_errors("reset para modo FIXed")
-        self.write(f"SOURce:MODE {'ACDC' if dc_offset_pu else 'AC'}")
-        self._modo_saida = "ACDC" if dc_offset_pu else "AC"
+        if self._p09_braco == "A":
+            self.write(f"SOURce:MODE {'ACDC' if dc_offset_pu else 'AC'}")
+            self._modo_saida = "ACDC" if dc_offset_pu else "AC"
+        # P-09 B/C: já em AC+DC desde configure_safe_baseline (saída OFF);
+        # SOURce:MODE não é reenviado com a saída ligada.
         self.write(f"SOURce:FREQuency {frequency_hz:.8g}")
         self.write("SOURce:FREQuency:MODE FIXed")
         self.write("SOURce:FUNCtion:SHAPe SINusoid")
         self._forma_atual = "SINusoid"
         self.write(f"SOURce:VOLTage {base_voltage_rms:.8g}")
-        if dc_offset_pu:
+        if self._p09_braco != "A":
+            # Offset imediato (senoide antes do LIST): o global, 0 sem classe
+            # de offset. Válido: a conexão está em AC+DC.
+            offset_v = dc_offset_pu * base_voltage_rms * math.sqrt(2.0)
+            self.write(f"SOURce:VOLTage:OFFSet {offset_v:.8g}")
+        elif dc_offset_pu:
             # Válido porque _modo_saida já é ACDC (linha acima) — ver
             # disable_dc_offset() sobre por que a ordem importa.
             offset_v = dc_offset_pu * base_voltage_rms * math.sqrt(2.0)
@@ -1571,44 +2203,19 @@ class AmetekMX30:
         # ~1s por TRACE (~12-15s para 12 ciclos a 60 Hz), o custo recorrente
         # que se repetia mesmo sem nenhuma mudança de forma/tensão/frequência
         # (ex.: repetir o preflight de 5V várias vezes na mesma sessão da CLI).
-        signature = (
-            waveform.tobytes(), trace_names,
-            float(base_voltage_rms), float(frequency_hz), float(dc_offset_pu),
-        )
-        reaproveitar = (
-            not self.simulated
-            and self._last_capture_signature == signature
-            and self._trace_catalog_contains(trace_names)
-        )
         if reaproveitar:
             logger.info(
                 "TRACe idêntica à última programada nesta conexão (%d ciclos, "
                 "%.3f Vrms, %.3f Hz); reaproveitando (~%ds de escrita em Flash evitados).",
                 len(trace_names), base_voltage_rms, frequency_hz, len(trace_names),
             )
-            list_voltages = list(self._last_capture_list_voltages)
-            reconstructed_peak_v = self._last_capture_peak_v
+            # Reaproveita apenas as TRACEs. RMS e pico vêm sempre da
+            # programação recalculada e validada contra os limites atuais.
         else:
             self._ensure_trace_slots(trace_names)
 
-            list_voltages = [float(value) for value in programacao.list_voltages_rms]
-            reconstructed_peak_v = programacao.pico_reconstruido_v
             for index, name in enumerate(trace_names):
-                if list_voltages[index] > self.max_voltage_rms:
-                    logger.warning(
-                        "Ciclo %d: %.3f Vrms acima do limite configurado %.3f Vrms; aceito.",
-                        index, list_voltages[index], self.max_voltage_rms,
-                    )
-                if (
-                    programacao.pico_acumulado_v[index] > self.max_peak_v
-                    and np.any(programacao.traces[index])
-                ):
-                    logger.warning(
-                        "TRACE reconstruída atingiria %.3f Vp, acima do limite %.3f Vp; prosseguindo.",
-                        programacao.pico_acumulado_v[index], self.max_peak_v,
-                    )
                 self.write(programacao.comando_trace(index))
-                self.escritas_trace += 1
                 # A transferência serial em 115200 baud na Rev. 5.53 pode deixar o buffer ocupado
                 # se checado imediatamente via SYST:ERR?. Limpamos com *CLS e aguardamos o processamento.
                 if not self.simulated:
@@ -1622,15 +2229,16 @@ class AmetekMX30:
         # TRACE precisa terminar exatamente quando o ciclo real dela termina,
         # senão o próximo passo do LIST começa no meio de um ciclo.
         dwell_s = pontos_por_ciclo / self.FS_HZ
-        names = ",".join(trace_names)
-        voltages = formatar_valores(list_voltages)
-        dwells = ",".join(f"{dwell_s:.10g}" for _ in trace_names)
+        passos_nomes = programacao.passos_nomes
+        names = ",".join(passos_nomes)
+        voltages = programacao.texto_list_voltages()
+        dwells = ",".join(f"{dwell_s:.10g}" for _ in passos_nomes)
         # "1" era lido pelo firmware Rev. 5.53 como "repete uma vez" (toca
         # cada ciclo 2x), não "sem repetição" -- confirmado na bancada
         # (CHANGELOG/v1.9.md hipótese, v1.10 confirmação): NOTCH real levou
         # 516ms (2,58x os ~200ms nominais de 12 ciclos a 60Hz) entre
         # apos_trigger e transiente_concluido.
-        repeats = ",".join("0" for _ in trace_names)
+        repeats = ",".join("0" for _ in passos_nomes)
         # Cada comando de dados de LISTA é confirmado IMEDIATAMENTE pela sua
         # própria consulta ":POINts?" (write seguido de query, sem delay
         # adivinhado) — se um comando não "pegar" (ex.: o firmware ainda
@@ -1639,7 +2247,7 @@ class AmetekMX30:
         # Diferente de TRACe:DATA (gravação em Flash, sem query dedicada no
         # manual — ver o time.sleep(1.0) acima), estes comandos SOURce:LIST:*
         # são apenas configuração em RAM e têm consulta ":POINts?" própria.
-        expected = len(trace_names)
+        expected = len(passos_nomes)
         list_data_commands = (
             (f"SOURce:LIST:FUNCtion:SHAPe {names}", "SOURce:LIST:FUNCtion:POINts?"),
             (f"SOURce:LIST:VOLTage {voltages}", "SOURce:LIST:VOLTage:POINts?"),
@@ -1657,6 +2265,16 @@ class AmetekMX30:
                 raise InstrumentHardwareError(
                     f"{points_query} retornou {actual} logo após {command!r}; esperado {expected}"
                 )
+        # Ao fim da LIST a forma FIXA fica na última TRACE da lista: sem isto,
+        # select_sine_shape() achava que ainda era SINusoid e não restaurava.
+        # Sessão 2026-10-22 14:41: a 18 e a 19 rodaram depois da 17 com a
+        # forma entalhada dela (THD ~4,7%, ímpares de 2-3%) e reprovaram; no
+        # rerun sem a 17 antes, passaram.
+        self._forma_atual = "LIST"
+        if self._p09_braco == "C":
+            self._programar_offsets_lista(programacao, expected)
+        elif self._p09_braco == "B":
+            self._zerar_offsets_lista("captura B", expected)
         for command in (
             # Rev. 5.53 rejeita ':COUNt' (-113 Undefined header); confirmado
             # em preflight_new.py --list-diagnostics testando as 4 variantes
@@ -1693,7 +2311,7 @@ class AmetekMX30:
                 self._log_diagnostico("apos_voltage_mode_list")
         self.last_programmed_peak_v = reconstructed_peak_v
         self.ultima_programacao = programacao
-        self._last_cycles = ciclos
+        self._last_cycles = len(passos_nomes)
         # A saída fica ligada durante toda a bateria (energize_baseline() é
         # chamado uma vez, fora daqui). Se o ABORt/reprogramação acima
         # derrubou o relé por algum motivo, religa aqui — já estamos em modo
@@ -1703,6 +2321,37 @@ class AmetekMX30:
             logger.warning("OUTPUT caiu durante a reprogramação da lista; religando.")
             self.output_enabled = True
             self.assert_no_errors("religar OUTPUT após reprogramação da lista")
+
+    def _programar_offsets_lista(self, programacao: ProgramacaoCaptura, esperado: int) -> None:
+        """Braço C (P-09): envia ``SOURce:LIST:VOLTage:OFFSet`` (NÃO confirmado
+        no manual) e confere a fila e a leitura de volta (quantidade e valores,
+        com a mesma tolerância de readback de ``arm()`` mais a resolução de
+        0,1 V). Qualquer divergência recusa a captura."""
+        command = f"{self.COMANDO_LIST_OFFSET} {programacao.texto_list_offsets()}"
+        self.write(command)
+        errors = self.check_errors()
+        if errors:
+            raise OffsetPorPassoNaoSuportadoError(
+                f"AMETEK rejeitou {command!r} (P-09 braço C): {errors}"
+            )
+        enviados = [float(v) for v in programacao.passos_offsets_v]
+        try:
+            lidos = [float(v) for v in self.query(self.CONSULTA_LIST_OFFSET).split(",")]
+        except ValueError as exc:
+            raise InstrumentHardwareError(
+                f"{self.CONSULTA_LIST_OFFSET} devolveu resposta ilegível após {command[:60]!r}..."
+            ) from exc
+        if len(lidos) != esperado or len(enviados) != esperado:
+            raise InstrumentHardwareError(
+                f"{self.CONSULTA_LIST_OFFSET} devolveu {len(lidos)} pontos; esperado {esperado}"
+            )
+        for index, (enviado, lido) in enumerate(zip(enviados, lidos)):
+            tolerancia = self.RESOLUCAO_TENSAO_V + self.TOLERANCIA_READBACK * abs(enviado)
+            if not math.isfinite(lido) or abs(lido - enviado) > tolerancia:
+                raise InstrumentHardwareError(
+                    f"Offset do passo {index}: lido {lido:.8g} V, enviado {enviado:.8g} V "
+                    f"(tolerância {tolerancia:.3g} V)"
+                )
 
     def arm(self, timeout_s: float = 20.0) -> None:
         """Arma o sistema de trigger para um transiente já configurado (PULSe/STEP/CSINe
@@ -1934,7 +2583,11 @@ class AmetekMX30:
             time.sleep(0.05)
         raise TimeoutError("AMETEK não concluiu a lista transitória")
 
-    def safe_shutdown(self) -> None:
+    def safe_shutdown(self) -> bool:
+        """ABORt + OUTPUT OFF. Devolve True só quando o OFF foi confirmado
+        (``OUTPut:STATe?`` na bancada; no simulado, o estado simulado) — False
+        quando não havia conexão ou a confirmação falhou (logado). Nunca levanta."""
+        confirmado = False
         try:
             if self.simulated or self._resource is not None:
                 # Saia primeiro de INIT/WAIT/BUSY. A Rev. 5.53 pode ignorar a
@@ -1957,8 +2610,22 @@ class AmetekMX30:
                         raise InstrumentHardwareError(
                             f"SHUTDOWN NÃO CONFIRMADO: OUTPut:STATe?={state!r}"
                         )
+                confirmado = True
+                if self._p09_braco != "A" and self._modo_saida != "AC":
+                    # P-09 B/C: saída já OFF (confirmada acima na bancada);
+                    # zera os offsets de LIST (ainda em AC+DC) e só então volta
+                    # a AC, sem troca de modo energizada.
+                    try:
+                        self._zerar_offsets_lista("safe_shutdown")
+                    except BracoP09Error:
+                        logger.exception("Offsets de LIST não confirmados zerados no shutdown (saída OFF)")
+                    self._raw_write("SOURce:MODE AC")
+                    self._modo_saida = "AC"
+                    self._p09_preparado = False
         except Exception:
             logger.exception("Não foi possível confirmar shutdown da AMETEK")
+            return False
+        return confirmado
 
     def measure_voltage(self) -> float:
         # ATENÇÃO (ACDC): com ``SOURce:MODE ACDC`` (classe 19) esta leitura é o

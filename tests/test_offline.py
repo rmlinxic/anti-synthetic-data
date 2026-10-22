@@ -634,6 +634,21 @@ class AmetekTests(unittest.TestCase):
         source.restaurar_forma_e_modo_padrao()
         self.assertEqual(source.command_log, [])
 
+    def test_forma_volta_a_senoide_depois_de_classe_waveform(self):
+        """Regressão de bancada (2026-10-22): depois da LIST de TRACEs de uma
+        classe waveform (17), restaurar_forma_e_modo_padrao() não mandava
+        FUNCtion:SHAPe SINusoid, e as nativas seguintes (18, 19) tocaram a
+        forma entalhada da 17."""
+        source = AmetekMX30(simulated=True, max_voltage_rms=10.0, max_peak_v=100.0, max_current_a=0.5)
+        t = np.arange(6000, dtype=np.float64) / 30000.0
+        source.program_capture(np.sin(2.0 * np.pi * 50.0 * t), base_voltage_rms=5.0, frequency_hz=50.0)
+        source.command_log.clear()
+        source.restaurar_forma_e_modo_padrao()
+        self.assertEqual(source.command_log[:3], ["SOURce:FUNCtion:SHAPe SINusoid", "*WAI", "SYSTem:ERRor?"])
+        source.command_log.clear()
+        source.restaurar_forma_e_modo_padrao()
+        self.assertEqual(source.command_log, [])
+
     def test_disable_dc_offset_roda_de_verdade_quando_modo_e_acdc(self):
         source = AmetekMX30(simulated=True, max_voltage_rms=10.0, max_peak_v=100.0, max_current_a=0.5)
         source.enable_dc_offset(1.0, ac_peak_v=7.0)
@@ -4266,10 +4281,19 @@ class LimiteDeBancada220VTests(unittest.TestCase):
                     self.assertAlmostEqual(info["extremo_previsto_v"], esperado, places=9, msg=classe_id)
 
     def test_220v_reduz_09_10_11_14_16_17_e_tudo_cabe_no_padrao(self):
+        # Capturas recusadas a 220 V desde as recalibrações de 2026-10-22 (127 V/60 Hz):
+        # 17 (1,575) nem com a redução mínima; 14 (1,200) idem; 05 (1,255), 18 (1,264)
+        # e uma da 19 (1,119) são nativas, puladas por passar do teto (sem redução).
+        recusadas_esperadas = {"05": 1, "14": 3, "17": 3, "18": 1, "19": 1}
         reduzidas = set()
+        recusadas = {}
         for indice in range(1, 21):
             classe_id = f"{indice:02d}"
             for info in self._avaliar_classe(classe_id):
+                if not info["cabe"]:
+                    recusadas[classe_id] = recusadas.get(classe_id, 0) + 1
+                    self.assertIn("teto", info["motivo"], classe_id)
+                    continue
                 self.assertTrue(info["cabe"], (classe_id, info.get("motivo")))
                 self.assertLessEqual(info["extremo_previsto_v"], self.TETO + 1e-6, classe_id)
                 if "fator_disturbio_bancada" in info:
@@ -4281,7 +4305,10 @@ class LimiteDeBancada220VTests(unittest.TestCase):
                     self.assertGreater(info["extremo_previsto_v"], self.TETO - 1.0, classe_id)
         # 17: só na seed padrão (pico de 368 V × 1,031 × 1,10 = 417 V, 1 V acima).
         # 09: desde a recalibração de 2026-10-07 (fator 1,002 -> 1,036 a 127 V).
-        self.assertEqual(reduzidas, {"09", "10", "11", "14", "16", "17"})
+        # 07: desde a recalibração de 2026-10-22 (fator 1,186 -> 1,615 a 127 V).
+        # 06, 12, 13: desde a recalibração com a campanha de 2026-10-22 (1,232; 1,47; 1,292).
+        self.assertEqual(recusadas, recusadas_esperadas)
+        self.assertEqual(reduzidas, {"06", "07", "09", "10", "11", "12", "13", "16"})
 
     def test_reducao_mantem_a_senoide_fora_do_disturbio_e_nao_muda_gerar(self):
         experimento = self._instancia("16")
@@ -5464,6 +5491,10 @@ class SorteioInicioDuracaoFaseTests(unittest.TestCase):
         np.testing.assert_allclose(forma, senoide + fracao * (modelo - senoide), atol=1e-12)
 
     def test_todas_as_classes_cabem_a_220v_com_sorteio(self):
+        # Exceções desde as recalibrações de 2026-10-22 (127 V/60 Hz): capturas
+        # recusadas pelo teto, mesmas classes do teste de 220 V sem sorteio.
+        recusadas_esperadas = {"13": 1, "14": 3, "17": 3, "18": 1, "19": 1}
+        recusadas = {}
         for classe_id in self.CLASSES:
             if classe_id == "03":
                 continue  # 03 a 220 V já pulava níveis (1,4 pu > 300 Vrms)
@@ -5472,7 +5503,10 @@ class SorteioInicioDuracaoFaseTests(unittest.TestCase):
             experimento = _carregar_classe(classe_id)(mestre.Bancada(fonte, mock.Mock(), config))
             for indice_global, capture_index in experimento.plano_de_capturas(False):
                 info = experimento.avaliar_captura_na_bancada(indice_global, capture_index)
-                self.assertTrue(info["cabe"], (classe_id, indice_global, info.get("motivo")))
+                if not info["cabe"]:
+                    recusadas[classe_id] = recusadas.get(classe_id, 0) + 1
+                    self.assertIn("teto", info["motivo"], (classe_id, indice_global))
+        self.assertEqual(recusadas, recusadas_esperadas)
 
     def test_analisar_sessao_reconstroi_a_forma_com_sorteio(self):
         import analisar_sessao
@@ -5727,6 +5761,22 @@ class TresVersoesTests(unittest.TestCase):
                     forma, base_voltage_rms=base, frequency_hz=f0, dc_offset_pu=dc,
                 )
                 fonte = self._fonte()
+                # P04: o teste de serialização não pode exigir que o ORM
+                # programe formas que excedem os limites reais. Primeiro
+                # comprova a recusa sem IO; testa a mesma forma a 5 Vrms.
+                acima = (
+                    np.max(np.abs(forma)) * base * np.sqrt(2) > fonte.max_peak_v
+                    or programacao.pico_reconstruido_v > fonte.max_peak_v
+                    or np.max(programacao.list_voltages_rms) > fonte.max_voltage_rms
+                )
+                if acima:
+                    with self.assertRaises(ParameterOutOfBoundsError):
+                        fonte.program_capture(forma, base_voltage_rms=base, frequency_hz=f0, dc_offset_pu=dc)
+                    self.assertEqual(fonte.command_log, [])
+                    base = 5.0
+                    programacao = AmetekMX30.montar_programacao(
+                        forma, base_voltage_rms=base, frequency_hz=f0, dc_offset_pu=dc,
+                    )
                 fonte.program_capture(forma, base_voltage_rms=base, frequency_hz=f0, dc_offset_pu=dc)
                 enviados = [c for c in fonte.command_log if c.startswith("TRACe:DATA ")]
                 self.assertEqual(enviados, [programacao.comando_trace(i) for i in range(programacao.ciclos)])
@@ -6727,6 +6777,8 @@ class CliRecalibracaoEHtmlTests(unittest.TestCase):
                     mock.patch.object(self.sessao_cli, "_garantir_pasta_sessao"), \
                     mock.patch.object(self.sessao_cli, "autorizar_saida"), \
                     mock.patch.object(mestre, "SESSION_RESULTS_DIR", self.sessao), \
+                mock.patch.object(mestre, "scripts_da_bateria_fisica",
+                                  return_value=[p for p in mestre._experiment_scripts() if p.stem in ("01", "02")]), \
                     mock.patch.object(mestre.Bancada, "from_env", return_value=self._bancada_falsa(resultados)), \
                     mock.patch.object(self.sessao_cli, "_recalibrar_ao_fim") as recal, \
                     mock.patch.object(self.sessao_cli, "_gerar_html_ao_fim") as html:
@@ -6742,6 +6794,8 @@ class CliRecalibracaoEHtmlTests(unittest.TestCase):
                 mock.patch.object(self.sessao_cli, "_garantir_pasta_sessao"), \
                 mock.patch.object(self.sessao_cli, "autorizar_saida"), \
                 mock.patch.object(mestre, "SESSION_RESULTS_DIR", self.sessao), \
+                mock.patch.object(mestre, "scripts_da_bateria_fisica",
+                                  return_value=[p for p in mestre._experiment_scripts() if p.stem in ("01", "02")]), \
                 mock.patch.object(mestre.Bancada, "from_env",
                                   return_value=self._bancada_falsa(erro=mestre.CommunicationError("serial caiu"))), \
                 mock.patch.object(self.sessao_cli, "_recalibrar_ao_fim") as recal, \
@@ -6760,6 +6814,8 @@ class CliRecalibracaoEHtmlTests(unittest.TestCase):
                 mock.patch.object(self.sessao_cli, "_garantir_pasta_sessao"), \
                 mock.patch.object(self.sessao_cli, "autorizar_saida"), \
                 mock.patch.object(mestre, "SESSION_RESULTS_DIR", self.sessao), \
+                mock.patch.object(mestre, "scripts_da_bateria_fisica",
+                                  return_value=[p for p in mestre._experiment_scripts() if p.stem in ("01", "02")]), \
                 mock.patch.object(mestre.Bancada, "from_env", return_value=self._bancada_falsa(resultados)), \
                 mock.patch.object(self.sessao_cli, "_recalibrar_ao_fim", side_effect=RuntimeError("boom")), \
                 mock.patch.object(self.sessao_cli, "_gerar_html_ao_fim", side_effect=RuntimeError("boom")):
@@ -7182,8 +7238,10 @@ class RunListaTests(unittest.TestCase):
         self.assertEqual(codigo, 1)
         self.assertEqual(confirmar.call_args[0][1], "EXECUTAR-CLASSE-05")
 
-    def test_run_all_mantem_a_confirmacao_antiga(self):
-        with mock.patch.object(self.sessao, "confirmar", return_value=False) as confirmar:
+    def test_run_all_viavel_mantem_a_confirmacao_antiga(self):
+        with mock.patch.object(mestre, "scripts_da_bateria_fisica",
+                               return_value=[p for p in mestre._experiment_scripts() if p.stem in ("01", "02")]), \
+                mock.patch.object(self.sessao, "confirmar", return_value=False) as confirmar:
             codigo, _ = self._rodar(self.sessao.cmd_run, ["all"])
         self.assertEqual(codigo, 1)
         self.assertEqual(confirmar.call_args[0][1], "EXECUTAR-20-CLASSES")
@@ -7204,14 +7262,14 @@ class RunListaTests(unittest.TestCase):
         self.assertNotIn("  08  ", saida)
 
     def test_confirmacao_exige_a_lista_normalizada_case_sensitive(self):
-        recusadas = ("EXECUTAR-CLASSES-1-7,9-20", "executar-classes-01-07,09-20",
-                     "EXECUTAR-CLASSES-01-07,09-20 ", "EXECUTAR-CLASSE-01-07,09-20",
+        recusadas = ("EXECUTAR-CLASSES-1-3,5", "executar-classes-01-03,05",
+                     "EXECUTAR-CLASSES-01-03,05 ", "EXECUTAR-CLASSE-01-03,05",
                      "EXECUTAR-20-CLASSES", "")
         for resposta in recusadas:
             with self.subTest(resposta=resposta), \
                     mock.patch("builtins.input", return_value=resposta), \
                     mock.patch.object(mestre.Bancada, "from_env") as from_env:
-                codigo, saida = self._rodar(self.sessao.cmd_run, ["01-07,09-20"])
+                codigo, saida = self._rodar(self.sessao.cmd_run, ["01-03,05"])
                 self.assertEqual(codigo, 1)
                 self.assertIn("Cancelado", saida)
                 from_env.assert_not_called()
@@ -7270,13 +7328,13 @@ class RunListaTests(unittest.TestCase):
         self.assertIn("4/4 classes OK", saida)
         self.assertEqual(sorted(self.sessao.ultimo_resultado), ["01", "02", "03", "05"])
 
-    def test_run_lista_ignora_bateria_excluir_porque_roda_o_pedido(self):
+    def test_run_lista_aplica_bateria_excluir_conforme_pendencia_atualizada(self):
         executadas = []
         codigo, _ = self._executar_com_classes_falsas(
             ["02,03"], executadas,
             extra=[mock.patch.object(mestre, "BATERIA_EXCLUIR", ("02",))],
         )
-        self.assertEqual(executadas, ["02", "03"])
+        self.assertEqual(executadas, ["03"])
         self.assertEqual(codigo, 0)
 
     def test_run_lista_falha_de_experimento_nao_para_a_lista(self):
@@ -8574,6 +8632,7 @@ class NpzPorClasseTests(unittest.TestCase):
         a.iniciar_perfil("literatura")
         captura(a, "literatura", 1, 3.0)  # o processo morre aqui: sem consolidar
         self.assertEqual(len(list((pasta / "parcial" / "96_teste").glob("*.npz"))), 1)
+        a.close()  # Simula o lease liberado pelo SO ao morrer o escritor.
         recuperados = io.recuperar_parcial(pasta)
         self.assertEqual(recuperados, [pasta / "96_teste.npz"])
         with np.load(pasta / "96_teste.npz") as dados:
@@ -8737,7 +8796,7 @@ class NpzPorClasseTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             relatorio_html.main([str(pasta), "--perfis", "inexistente"])
 
-    def test_html_de_sessao_de_bancada_mostra_todas_as_capturas_sem_o_limite_do_simulado(self):
+    def test_html_de_sessao_de_bancada_limita_capturas_por_padrao(self):
         import relatorio_html
         classe, _ = self._classe_fisica()
         config = self._config(self.tmp / "fisica", snr_levels_db=(), capturas_override=5)
@@ -8745,7 +8804,7 @@ class NpzPorClasseTests(unittest.TestCase):
         with mock.patch.object(mestre.Bancada, "_carregar_classe_experimento", staticmethod(lambda p: classe)):
             bancada.executar_bateria([Path("96.py")], ("norma",))
         _, total = relatorio_html.gerar_relatorio(config.results_dir, self.tmp / "f.html", detalhes=0, dpi=30)
-        self.assertEqual(total, 5)
+        self.assertEqual(total, 3)
 
     def test_gerar_ruido_janela_le_o_formato_2_e_grava_snr_por_classe(self):
         gerar = _carregar_script("gerar_ruido_janela")
@@ -8762,6 +8821,38 @@ class NpzPorClasseTests(unittest.TestCase):
             ruido = dados["norma/tensao_pu"][1] - janela
             medido = 10.0 * math.log10(np.mean(janela ** 2) / np.mean(ruido ** 2))
             self.assertAlmostEqual(medido, 25.0, delta=1e-6)
+
+    def test_consumidores_fecham_writers_no_sucesso_e_na_falha(self):
+        import recortar_margem
+        gerar = _carregar_script("gerar_ruido_janela")
+        pasta = self._sessao_simulada_todos(self.tmp / "origem_close", "02").results_dir
+        construtor = self.sessao_io.ArquivoDaClasse
+        for nome, operacao in (("recorte", recortar_margem.recortar_sessao),
+                               ("ruido", gerar.gerar_sessao)):
+            for falha in (False, True):
+                with self.subTest(utilitario=nome, falha=falha):
+                    writers = []
+
+                    def construir(*args, **kwargs):
+                        writer = construtor(*args, **kwargs)
+                        writers.append(writer)  # Mantém vivo para testar close explícito.
+                        if falha:
+                            writer.consolidar = mock.Mock(side_effect=RuntimeError("falha de disco"))
+                        return writer
+
+                    with mock.patch.object(self.sessao_io, "ArquivoDaClasse", side_effect=construir):
+                        saida = self.tmp / f"{nome}_{falha}"
+                        if falha:
+                            with self.assertRaisesRegex(RuntimeError, "falha de disco"):
+                                operacao(pasta, saida)
+                        else:
+                            operacao(pasta, saida)
+                    self.assertTrue(writers)
+                    for writer in writers:
+                        with self.assertRaisesRegex(RuntimeError, "encerrado"):
+                            writer.iniciar_perfil("norma")
+                    with self.sessao_io.BloqueioSessao(saida, escritor=False):
+                        pass  # O lock é exclusivo mesmo com os writers ainda vivos.
 
     def test_gerar_tres_versoes_recusa_sessao_do_formato_2(self):
         gerar_tres = _carregar_script("gerar_tres_versoes")
@@ -8797,7 +8888,7 @@ class NpzPorClasseTests(unittest.TestCase):
                 self.assertEqual(sessao.cmd_set(["perfil", "xyz"]), 1)
         self.assertIn("set perfil norma|literatura|fronteira|todos", cli.HELP_TEXT)
 
-    def test_confirmacao_do_run_all_soma_capturas_e_trace_dos_tres_perfis(self):
+    def test_resumo_dos_tres_perfis_preserva_contagem_e_recusa_excesso(self):
         import io
         from contextlib import redirect_stdout
         cli, sessao = self._cli()
@@ -8822,10 +8913,9 @@ class NpzPorClasseTests(unittest.TestCase):
         self.assertEqual(sum(i["total"] for _, _, i in linhas), sozinhos)
         self.assertEqual(sum(i["escritas_trace"] for _, _, i in linhas), escritas)
         self.assertTrue(all("por_perfil" in i for _, _, i in linhas))
-        aviso, esperado = mensagens[0]
-        self.assertEqual(esperado, "EXECUTAR-20-CLASSES")
-        self.assertIn(f"Planejadas: {sozinhos} capturas", aviso)
-        self.assertIn("norma, literatura, fronteira", aviso)
+        self.assertEqual(mensagens, [])  # O orçamento precede confirmação.
+        self.assertGreater(escritas, mestre.LIMITE_ESCRITAS_TRACE_CONEXAO)
+        aviso = sessao._aviso_escritas_trace(linhas)
         self.assertIn(f"{escritas} gravações", aviso)
         self.assertIn("capturas repetidas evitadas", aviso)
 
@@ -9415,6 +9505,7 @@ class PerfisCompartilhadosTests(unittest.TestCase):
             "\n".join(json.dumps(r) for r in a.registros()) + "\n", encoding="utf-8")
         a.iniciar_perfil("fronteira")
         cap(a, "fronteira", 1, 3.0)  # processo morre antes de consolidar
+        a.close()  # Escritor encerrado antes da recuperação exclusiva.
         io.recuperar_parcial(pasta)
         with np.load(pasta / "97_teste.npz") as dados:
             self.assertEqual(sorted(str(p) for p in dados["perfis"]), ["fronteira", "literatura"])

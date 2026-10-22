@@ -15,6 +15,7 @@ Valores booleanos aceitos: `1/true/yes/on` e `0/false/no/off` (`env_bool`, `mest
 | `AMETEK_TIMEOUT_S` | `5` | timeout de leitura da serial |
 | `AMETEK_QUERY_EOT` | `1` | envia o byte `0x04` separado depois de cada comando (a USB da MX30 só responde assim) |
 | `AMETEK_EXPECTED_MODEL` | `MX30` | substring conferida no `*IDN?` |
+| `AMETEK_P09_BRACO` | `A` | Experimento P-09 (perda da média por ciclo). `A`: modo AC, como sempre. `B`: a conexão inteira em AC+DC com offset zero (isola o efeito AC+DC, P-17). `C`: AC+DC com offset DC por passo de LIST (`SOURce:LIST:VOLTage:OFFSet`, **não confirmado no manual**) igual à média de cada ciclo que a TRACe perde. B/C programam `SOURce:MODE ACDC` só com a saída OFF, ao fim de `configure_safe_baseline`, e voltam a AC em `safe_shutdown` depois do OFF; classes nativas também rodam em AC+DC. B e C consultam `SOURce:LIST:VOLTage:OFFSet?` antes de energizar (com suporte, os offsets de LIST são zerados fora das capturas C e no shutdown); C recusa a conexão (`OffsetPorPassoNaoSuportadoError`) se a fonte não confirmar, sem cair para A/B. Valor inválido é recusado ao abrir a conexão. Na CLI: `set p09 A\|B\|C` (próximo run); gravado no metadata como `p09_braco` |
 | `AMETEK_CLEAR_USER_WAVEFORMS` | `0` (`bench_config.ps1`: **`1`**) | `1` apaga as TRACes de usuário a cada conexão (`TRACe:DELete:ALL`, ~15 s); invalida o cache de TRACe entre conexões |
 | `AMETEK_SINCRONISMO` | `ESR` | consulta de sincronismo de `write()`: `ESR` (`*ESR?`) ou `OPC` (`*OPC?`); sem ganho com `OPC` |
 | `KEYSIGHT_RESOURCE` | `USB0::0x0957::0x17A4::MY59240844::0::INSTR` | endereço VISA; `AUTO` ou vazio = descoberta |
@@ -43,11 +44,23 @@ Valores booleanos aceitos: `1/true/yes/on` e `0/false/no/off` (`env_bool`, `mest
 | `MARGEM_ANTES_S`, `MARGEM_DEPOIS_S` | `0.020`, `0.050` | folga de captura física; **não reduzir** sem refazer a medida (`mestre.py:2004-2022`) |
 | `VALIDACAO_FISICA` | `1` | liga a validação pós-captura |
 | `VALIDACAO_TOL_ENVELOPE`, `VALIDACAO_TOL_THD` | `0.15`, `0.20` | tolerâncias da validação |
-| `BATERIA_EXCLUIR` | vazio | ids separados por vírgula que o `run all` físico pula (ex.: `08`); `run <NN>` ainda roda |
+| `BATERIA_EXCLUIR` | vazio | ids separados por vírgula que `run all` e `run <lista>` físicos excluem antes da confirmação (ex.: `08`); `run <NN>` isolado ainda roda |
+| `SALVAR_BRUTO_OSCILOSCOPIO` | `0` | preserva a exportação BYTE/NORMal antes da interpolação em arquivos separados; também controlado por `set diagnostico bruto on\|off`; não faz aquisição extra |
 | `DIAGNOSTICO_RETRIEVE_ESPERA_S` | `2.0` | espera mínima (s) entre a última escrita de TRACe e a leitura de `set diagnostico retrieve`; abaixo de 2 s avisa (quirk A2; `docs/diagnostico.md` §1.1). O liga/desliga é o comando `set diagnostico retrieve`, desligado por padrão |
 | `DIAGNOSTICO_ABRIR_TERMINAL` | `1` | `0`/`false`/`off`/`no` impede `set diagnostico on` de abrir a janela de `tail -f` |
 
 `scripts/diag_acdc_amplitude.py` também lê `BASE_VOLTAGE_RMS`, `GRID_FREQUENCY_HZ`, `VOLTAGE_PROBE_ATTENUATION`, `BENCH_MODE`.
+
+## Sequência da P-10 (classe 05: RMS e THD por nível)
+
+Sem variável nova: o nível sai de `capture_index` e da faixa do perfil (`thd_niveis`: norma 2/5/10/15/20 %, literatura 5/10/15/20/30 %). Sem `set capturas`, a 05 roda **só o nível 0** do perfil; `set capturas 1` (explícito) agrupa por nível e roda os cinco. Rota: até 20 % por CSINusoid, 30 % por TRACe (`rota_programacao` no metadata).
+
+| Ponto | Comandos | Capturas |
+|---|---|---|
+| 2 % (norma, CSIN) | `set perfil norma`, `set capturas 1`, `run 05` | 2, 5, 10, 15, 20 % (todos CSIN) |
+| 10, 15, 20 % (CSIN) e 30 % (TRACe) | `set perfil literatura`, `set capturas 1`, `run 05` | 5, 10, 15, 20 % (CSIN) e 30 % (TRACe, 12 gravações) |
+
+Cada `run` pede a confirmação digitada. Avaliação: `scripts/fechar_pendencias.py` (P-10) por nível e rota.
 
 ## Regras de `validate_bench_configuration()` (`mestre.py:366-387`)
 
@@ -57,4 +70,4 @@ Dentro do ORM, uma segunda barreira (`configure_safe_baseline`, `ametek_orm.py:1
 
 ## Variáveis que NÃO existem na `main`
 
-`AMETEK_PASSO_FINAL_SIN` pertence ao branch `feat/passo-final-sin` (PR #3, **pendente de validação na bancada**, não mesclado). Não use nem documente como existente na `main`.
+`AMETEK_PASSO_FINAL_SIN=0` é o padrão atual: passo final SINE experimental integrado ao checkout de execução, desligado até validação física (P-18). `1` habilita o passo extra na lista; não habilitar automaticamente durante coleta. Ver `docs/projeto/passo-final-sin.md`.
